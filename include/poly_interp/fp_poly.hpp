@@ -48,6 +48,20 @@ inline u32 add_mod(u32 a, u32 b, u32 mod) {
 inline u32 sub_mod(u32 a, u32 b, u32 mod) {
     return (a >= b) ? (a - b) : (a + mod - b);
 }
+// -------------------- [BARRETT] fast mod for u64 x with 32-bit prime mod --------------------
+inline u32 barrett_reduce_u64(u64 x, u32 mod, u64 im) {
+    // im = floor(2^64 / mod)
+    const u64 q = (u64)(((u128)x * im) >> 64);
+    u64 r = x - q * (u64)mod;   // r in [0, 2*mod)
+    if (r >= mod) r -= mod;
+    if (r >= mod) r -= mod;
+    return (u32)r;
+}
+
+inline u32 mul_mod_barrett(u32 a, u32 b, u32 mod, u64 im) {
+    return barrett_reduce_u64((u64)a * (u64)b, mod, im);
+}
+
 inline u32 mul_mod(u32 a, u32 b, u32 mod) {
     return (u64)a * b % mod;
 }
@@ -71,6 +85,8 @@ struct NTTCache {
     u32 mod = 0;
     u32 primitive_root = 0;
     int max_base = 0;
+
+    u64 barrett_im = 0; // floor(2^64 / mod)
 
     u32 cache_n = 0;                 // power of two
     std::vector<u32> root;           // size cache_n: base^i
@@ -101,12 +117,12 @@ inline void build_root_table(NTTCache& C, u32 new_n) {
 
     C.root[0] = 1;
     for (u32 i = 1; i < new_n; ++i) {
-        C.root[i] = mul_mod(C.root[i - 1], base, C.mod);
+        C.root[i] = mul_mod_barrett(C.root[i - 1], base, C.mod, C.barrett_im);
     }
 
     C.iroot[0] = 1;
     for (u32 i = 1; i < new_n; ++i) {
-        C.iroot[i] = mul_mod(C.iroot[i - 1], ibase, C.mod);
+        C.iroot[i] = mul_mod_barrett(C.iroot[i - 1], ibase, C.mod, C.barrett_im);
     }
 
     // inv_n table (fill up to logn)
@@ -130,6 +146,9 @@ inline NTTCache& ensure_ntt_cache(std::size_t prime_idx, u32 n) {
         C.max_base = prm.max_base;
         C.cache_n = 0;
         C.inv_ready_upto = -1;
+
+        // [BARRETT] im = floor(2^64 / mod)
+        C.barrett_im = (u64)(((u128)1 << 64) / (u128)C.mod);
     }
 
     if (C.mod != prm.mod) {
@@ -184,13 +203,13 @@ inline void ntt_cached(std::size_t prime_idx, std::vector<u32>& a, bool invert) 
         const u32 wlen = invert ? C.iroot[step] : C.root[step];
 
         for (u32 i = 0; i < n; i += len) {
-            u64 w = 1;
+            u32 w = 1;
             for (u32 j = 0; j < half; ++j) {
                 const u32 u = a[i + j];
-                const u32 v = (u32)(w * a[i + j + half] % mod);
+                const u32 v = barrett_reduce_u64((u64)w * (u64)a[i + j + half], mod, C.barrett_im);
                 a[i + j] = add_mod(u, v, mod);
                 a[i + j + half] = sub_mod(u, v, mod);
-                w = (w * wlen) % mod;
+                w = mul_mod_barrett(w, wlen, mod, C.barrett_im);
             }
         }
     }
@@ -248,7 +267,6 @@ inline std::vector<u32> convolution_mod_ntt(const std::vector<u32>& a,
     if (a.empty() || b.empty()) return {};
 
     const auto prm = kNTT[prime_idx];
-    const u32 mod = prm.mod;
 
     std::size_t need = a.size() + b.size() - 1;
     std::size_t ntt_n = 1;
@@ -258,6 +276,10 @@ inline std::vector<u32> convolution_mod_ntt(const std::vector<u32>& a,
         throw std::runtime_error("convolution_mod_ntt: NTT length exceeds prime capability");
     }
 
+    // [BARRETT] get cache to access barrett_im + mod (and ensure cache exists for ntt_n)
+    NTTCache& C = ensure_ntt_cache(prime_idx, (u32)ntt_n);
+    const u32 mod = C.mod;
+
     std::vector<u32> fa(ntt_n, 0), fb(ntt_n, 0);
     std::copy(a.begin(), a.end(), fa.begin());
     std::copy(b.begin(), b.end(), fb.begin());
@@ -265,8 +287,9 @@ inline std::vector<u32> convolution_mod_ntt(const std::vector<u32>& a,
     ntt_cached(prime_idx, fa, false);
     ntt_cached(prime_idx, fb, false);
 
+    // [BARRETT] pointwise multiply without %
     for (std::size_t i = 0; i < ntt_n; ++i) {
-        fa[i] = (u32)((u64)fa[i] * fb[i] % mod);
+        fa[i] = mul_mod_barrett(fa[i], fb[i], mod, C.barrett_im);
     }
 
     ntt_cached(prime_idx, fa, true);
