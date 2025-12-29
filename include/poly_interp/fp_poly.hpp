@@ -775,11 +775,68 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
     if (k == 0) return FpPoly(F);
     if (a.is_zero() || b.is_zero()) return FpPoly(F);
 
-    FpPoly prod = a.mul(b);
-    if (prod.c_.size() > k) prod.c_.resize(k);
-    prod.trim();
-    return prod;
+    // 只需要低 k 项 -> 先把输入截断到 k 项
+    const size_type an = std::min<size_type>(a.c_.size(), k);
+    const size_type bn = std::min<size_type>(b.c_.size(), k);
+    if (an == 0 || bn == 0) return FpPoly(F);
+
+    const size_type full_need = an + bn - 1;
+    const size_type out_need = std::min<size_type>(k, full_need);
+    if (out_need == 0) return FpPoly(F);
+
+    // 小规模：直接 O(k^2) 低位乘（只算 i+j < out_need）
+    if (out_need <= 256 || std::min(an, bn) <= 64) {
+        std::vector<Fp> out(out_need, F.zero());
+        for (size_type i = 0; i < an; ++i) {
+            const Fp ai = a.c_[i];
+            if (ai.v == 0) continue;
+            const size_type jmax = std::min<size_type>(bn, out_need - i);
+            for (size_type j = 0; j < jmax; ++j) {
+                const Fp bj = b.c_[j];
+                if (bj.v == 0) continue;
+                out[i + j] = F.add(out[i + j], F.mul(ai, bj));
+            }
+        }
+        FpPoly r(F, std::move(out));
+        r.trim();
+        return r;
+    }
+
+    // 大规模：NTT/CRT，但只对低位需要的部分做输入截断，并且只合并 out_need 个系数
+    const u64 p = F.modulus();
+    constexpr std::size_t K = pf::detail::kNTT.size();
+
+    std::vector<std::vector<pf::detail::u32>> residues;
+    residues.resize(K);
+
+    for (std::size_t idxp = 0; idxp < K; ++idxp) {
+        const auto prm = pf::detail::kNTT[idxp];
+
+        std::vector<pf::detail::u32> A32(an), B32(bn);
+        for (size_type i = 0; i < an; ++i) A32[i] = (pf::detail::u32)(a.c_[i].v % prm.mod);
+        for (size_type j = 0; j < bn; ++j) B32[j] = (pf::detail::u32)(b.c_[j].v % prm.mod);
+
+        residues[idxp] = pf::detail::convolution_mod_ntt(A32, B32, idxp);
+        // 只保留我们需要合并的前 out_need 项（节省内存/后续访问）
+        if (residues[idxp].size() > out_need) residues[idxp].resize(out_need);
+    }
+
+    std::vector<Fp> out(out_need, F.zero());
+    std::array<pf::detail::u32, K> r{};
+
+    for (size_type i = 0; i < out_need; ++i) {
+        for (std::size_t idxp = 0; idxp < K; ++idxp) {
+            r[idxp] = residues[idxp][i];
+        }
+        const u64 val = pf::detail::garner_crt_to_mod_p(r.data(), p);
+        out[i] = Fp{val};
+    }
+
+    FpPoly res(F, std::move(out));
+    res.trim();
+    return res;
 }
+
 
 inline pf::FpPoly pf::FpPoly::inv_series_poly(const FpPoly& f, size_type k) {
     f.require_ctx();
