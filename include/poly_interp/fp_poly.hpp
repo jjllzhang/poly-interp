@@ -261,10 +261,25 @@ inline void ntt(std::vector<u32>& a, bool invert, u32 mod, u32 primitive_root) {
     }
 }
 
-inline std::vector<u32> convolution_mod_ntt(const std::vector<u32>& a,
-                                            const std::vector<u32>& b,
-                                            std::size_t prime_idx) {
-    if (a.empty() || b.empty()) return {};
+// -------------------- [CONV SCRATCH] reuse fb buffer per prime --------------------
+struct NTTConvScratch {
+    std::vector<u32> fb;
+};
+
+inline NTTConvScratch& conv_scratch(std::size_t prime_idx) {
+    static thread_local std::array<NTTConvScratch, kNTT.size()> S;
+    return S[prime_idx];
+}
+
+// Compute convolution into `fa` (fa is also the NTT working buffer and final output).
+inline void convolution_mod_ntt_into(std::vector<u32>& fa,
+                                     const std::vector<u32>& a,
+                                     const std::vector<u32>& b,
+                                     std::size_t prime_idx) {
+    if (a.empty() || b.empty()) {
+        fa.clear();
+        return;
+    }
 
     const auto prm = kNTT[prime_idx];
 
@@ -273,29 +288,41 @@ inline std::vector<u32> convolution_mod_ntt(const std::vector<u32>& a,
     while (ntt_n < need) ntt_n <<= 1;
 
     if ((int)__builtin_ctzll((unsigned long long)ntt_n) > prm.max_base) {
-        throw std::runtime_error("convolution_mod_ntt: NTT length exceeds prime capability");
+        throw std::runtime_error("convolution_mod_ntt_into: NTT length exceeds prime capability");
     }
 
-    // [BARRETT] get cache to access barrett_im + mod (and ensure cache exists for ntt_n)
+    // Ensure NTT plan exists and get Barrett constants / mod
     NTTCache& C = ensure_ntt_cache(prime_idx, (u32)ntt_n);
     const u32 mod = C.mod;
 
-    std::vector<u32> fa(ntt_n, 0), fb(ntt_n, 0);
+    // fa: output + working buffer (reuse caller's capacity)
+    fa.assign(ntt_n, 0);
     std::copy(a.begin(), a.end(), fa.begin());
-    std::copy(b.begin(), b.end(), fb.begin());
+
+    // fb: scratch buffer (thread_local reuse)
+    auto& S = conv_scratch(prime_idx);
+    S.fb.assign(ntt_n, 0);
+    std::copy(b.begin(), b.end(), S.fb.begin());
 
     ntt_cached(prime_idx, fa, false);
-    ntt_cached(prime_idx, fb, false);
+    ntt_cached(prime_idx, S.fb, false);
 
-    // [BARRETT] pointwise multiply without %
     for (std::size_t i = 0; i < ntt_n; ++i) {
-        fa[i] = mul_mod_barrett(fa[i], fb[i], mod, C.barrett_im);
+        fa[i] = mul_mod_barrett(fa[i], S.fb[i], mod, C.barrett_im);
     }
 
     ntt_cached(prime_idx, fa, true);
 
     fa.resize(need);
-    return fa;
+}
+
+
+inline std::vector<u32> convolution_mod_ntt(const std::vector<u32>& a,
+                                            const std::vector<u32>& b,
+                                            std::size_t prime_idx) {
+    std::vector<u32> out;
+    convolution_mod_ntt_into(out, a, b, prime_idx);
+    return out;
 }
 
 
@@ -633,9 +660,7 @@ public:
         const std::size_t need = n + m - 1;
 
         // 小规模继续用朴素（避免 NTT 常数）
-        // 你可以按机器再调阈值
         if (need <= 256 || std::min(n, m) <= 64) {
-            // ---- naive O(n*m) ----
             std::vector<Fp> out(need, F.zero());
             for (std::size_t i = 0; i < n; ++i) {
                 if (c_[i].v == 0) continue;
@@ -649,33 +674,33 @@ public:
             return r;
         }
 
-        // ---- NTT (several friendly primes) + CRT/Garner back to modulus p ----
-        // For each NTT prime, compute convolution residues, then Garner to mod p.
         const u64 p = F.modulus();
 
-        // prepare inputs as u32 residues per prime
+        // residues[k] will be reused as fa buffer/output for each prime
         std::vector<std::vector<detail::u32>> residues(detail::kNTT.size());
 
-        // compute each modulus convolution
         for (std::size_t k = 0; k < detail::kNTT.size(); ++k) {
             const auto prm = detail::kNTT[k];
 
-            std::vector<detail::u32> a(n), b(m);
-            for (std::size_t i = 0; i < n; ++i) a[i] = (detail::u32)(c_[i].v % prm.mod);
-            for (std::size_t j = 0; j < m; ++j) b[j] = (detail::u32)(g.c_[j].v % prm.mod);
+            std::vector<detail::u32> a32(n), b32(m);
+            for (std::size_t i = 0; i < n; ++i) a32[i] = (detail::u32)(c_[i].v % prm.mod);
+            for (std::size_t j = 0; j < m; ++j) b32[j] = (detail::u32)(g.c_[j].v % prm.mod);
 
-            residues[k] = detail::convolution_mod_ntt(a, b, k);
+            // [BUFFER REUSE] in-place convolution: residues[k] is fa (work + output),
+            // fb is thread_local scratch inside convolution_mod_ntt_into
+            detail::convolution_mod_ntt_into(residues[k], a32, b32, k);
             // residues[k].size() == need
         }
 
-        // Garner combine to F_p
         std::vector<Fp> out(need, F.zero());
-        std::vector<detail::u32> r(detail::kNTT.size());
-
         pf::detail::CRT6Plan crt_plan(p);
 
+        // [small alloc win] avoid per-call vector for r
+        std::array<detail::u32, 6> r{};
+        static_assert(detail::kNTT.size() == 6, "CRT6Plan assumes 6 NTT primes");
+
         for (std::size_t idx = 0; idx < need; ++idx) {
-            for (std::size_t k = 0; k < pf::detail::kNTT.size(); ++k) {
+            for (std::size_t k = 0; k < detail::kNTT.size(); ++k) {
                 r[k] = residues[k][idx];
             }
             u64 val = crt_plan.combine_to_mod_p(r.data());
@@ -966,7 +991,7 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
         for (size_type i = 0; i < an; ++i) A32[i] = (pf::detail::u32)(a.c_[i].v % prm.mod);
         for (size_type j = 0; j < bn; ++j) B32[j] = (pf::detail::u32)(b.c_[j].v % prm.mod);
 
-        residues[idxp] = pf::detail::convolution_mod_ntt(A32, B32, idxp);
+        pf::detail::convolution_mod_ntt_into(residues[idxp], A32, B32, idxp);
         if (residues[idxp].size() > out_need) residues[idxp].resize(out_need);
     }
 
