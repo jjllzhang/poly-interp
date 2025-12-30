@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cmath>
+#include <vector>
 
 
 namespace pf {
@@ -79,6 +80,31 @@ inline u32 pow_mod(u32 a, u64 e, u32 mod) {
 inline u32 inv_mod(u32 a, u32 mod) {
     // mod is prime
     return pow_mod(a, (u64)mod - 2, mod);
+}
+
+// -------------------- [BITREV CACHE] --------------------
+// Cache bit-reversal permutation tables by logn (independent of modulus).
+inline const std::vector<u32>& bitrev_table(u32 n) {
+    if (n == 0 || (n & (n - 1)) != 0) {
+        throw std::runtime_error("bitrev_table: n must be power-of-two");
+    }
+    const int logn = __builtin_ctz((unsigned)n);
+
+    struct RevCache {
+        std::array<std::vector<u32>, 32> tab;
+    };
+    static thread_local RevCache C;
+
+    auto& rev = C.tab[logn];
+    if (rev.size() == n) return rev;
+
+    rev.resize(n);
+    rev[0] = 0;
+    // rev[i] = (rev[i>>1] >> 1) | ((i&1) << (logn-1))
+    for (u32 i = 1; i < n; ++i) {
+        rev[i] = (rev[i >> 1] >> 1) | ((i & 1u) << (logn - 1));
+    }
+    return rev;
 }
 
 struct NTTCache {
@@ -185,11 +211,10 @@ inline void ntt_cached(std::size_t prime_idx, std::vector<u32>& a, bool invert) 
     NTTCache& C = ensure_ntt_cache(prime_idx, n);
     const u32 mod = C.mod;
 
-    // bit-reversal permutation (same as your old code, no extra memory)
-    for (u32 i = 1, j = 0; i < n; ++i) {
-        u32 bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
+    // [BITREV CACHE] cached bit-reversal permutation
+    const auto& rev = bitrev_table(n);
+    for (u32 i = 0; i < n; ++i) {
+        const u32 j = rev[i];
         if (i < j) std::swap(a[i], a[j]);
     }
 
@@ -296,13 +321,19 @@ inline void convolution_mod_ntt_into(std::vector<u32>& fa,
     const u32 mod = C.mod;
 
     // fa: output + working buffer (reuse caller's capacity)
-    fa.assign(ntt_n, 0);
+    fa.resize(ntt_n);
     std::copy(a.begin(), a.end(), fa.begin());
+    if (a.size() < ntt_n) {
+        std::fill(fa.begin() + a.size(), fa.end(), 0u); // only clear the tail
+    }
 
     // fb: scratch buffer (thread_local reuse)
     auto& S = conv_scratch(prime_idx);
-    S.fb.assign(ntt_n, 0);
+    S.fb.resize(ntt_n);
     std::copy(b.begin(), b.end(), S.fb.begin());
+    if (b.size() < ntt_n) {
+        std::fill(S.fb.begin() + b.size(), S.fb.end(), 0u); // only clear the tail
+    }
 
     ntt_cached(prime_idx, fa, false);
     ntt_cached(prime_idx, S.fb, false);
@@ -686,8 +717,17 @@ public:
             const auto prm = detail::kNTT[k];
 
             std::vector<detail::u32> a32(n), b32(m);
-            for (std::size_t i = 0; i < n; ++i) a32[i] = (detail::u32)(c_[i].v % prm.mod);
-            for (std::size_t j = 0; j < m; ++j) b32[j] = (detail::u32)(g.c_[j].v % prm.mod);
+            // [BARRETT INPUT REDUCE] avoid % in input conversion
+            auto& CC = detail::ensure_ntt_cache(k, 1u); // only to access barrett_im (no rebuild)
+            const detail::u32 mod = prm.mod;
+            const detail::u64 im  = CC.barrett_im;
+
+            for (std::size_t i = 0; i < n; ++i) {
+                a32[i] = detail::barrett_reduce_u64((detail::u64)c_[i].v, mod, im);
+            }
+            for (std::size_t j = 0; j < m; ++j) {
+                b32[j] = detail::barrett_reduce_u64((detail::u64)g.c_[j].v, mod, im);
+            }
 
             // [BUFFER REUSE] in-place convolution: residues[k] is fa (work + output),
             // fb is thread_local scratch inside convolution_mod_ntt_into
@@ -991,8 +1031,17 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
         const auto prm = pf::detail::kNTT[idxp];
 
         std::vector<pf::detail::u32> A32(an), B32(bn);
-        for (size_type i = 0; i < an; ++i) A32[i] = (pf::detail::u32)(a.c_[i].v % prm.mod);
-        for (size_type j = 0; j < bn; ++j) B32[j] = (pf::detail::u32)(b.c_[j].v % prm.mod);
+        // [BARRETT INPUT REDUCE] avoid % in input conversion
+        auto& CC = pf::detail::ensure_ntt_cache(idxp, 1u);
+        const pf::detail::u32 mod = prm.mod;
+        const pf::detail::u64 im  = CC.barrett_im;
+
+        for (size_type i = 0; i < an; ++i) {
+            A32[i] = pf::detail::barrett_reduce_u64((pf::detail::u64)a.c_[i].v, mod, im);
+        }
+        for (size_type j = 0; j < bn; ++j) {
+            B32[j] = pf::detail::barrett_reduce_u64((pf::detail::u64)b.c_[j].v, mod, im);
+        }
 
         pf::detail::convolution_mod_ntt_into(residues[idxp], A32, B32, idxp);
         if (residues[idxp].size() > out_need) residues[idxp].resize(out_need);
