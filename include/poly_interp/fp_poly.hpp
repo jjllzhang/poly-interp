@@ -224,19 +224,19 @@ inline NTTCache& ensure_ntt_cache(std::size_t prime_idx, u32 n) {
 inline void ntt_cached(std::size_t prime_idx, std::vector<u32>& a, bool invert) {
     const u32 n = (u32)a.size();
     NTTCache& C = ensure_ntt_cache(prime_idx, n);
-    const u32 mod = C.mod;
-    const u32 mod2 = mod + mod;     // safe for your primes (< 2^32)
-    const u64 im = C.barrett_im;
+    const u32 mod  = C.mod;
+    const u32 mod2 = mod + mod;
+    const u64 im   = C.barrett_im;
     const u32 cache_n = C.cache_n;
 
 #ifndef NDEBUG
-    // In debug, make sure inputs are in [0, mod) (cheap fix if slightly out)
+    // Debug safeguard: keep inputs in [0, mod)
     for (u32 i = 0; i < n; ++i) {
         if (a[i] >= mod) a[i] %= mod;
     }
 #endif
 
-    // [BITREV CACHE]
+    // bit-reversal
     const auto& rev = bitrev_table(n);
     for (u32 i = 0; i < n; ++i) {
         const u32 j = rev[i];
@@ -245,25 +245,26 @@ inline void ntt_cached(std::size_t prime_idx, std::vector<u32>& a, bool invert) 
 
     u32* A = a.data();
 
+    // Twiddle table pointer: root[idx] = base^idx, iroot similarly.
+    const u32* RT = invert ? C.iroot.data() : C.root.data();
+
     for (u32 len = 2; len <= n; len <<= 1) {
         const u32 half = len >> 1;
-        const u32 step = cache_n / len;
-        const u32 wlen = invert ? C.iroot[step] : C.root[step];
+        const u32 step = cache_n / len;   // twiddle index stride in root table
 
         for (u32 blk = 0; blk < n; blk += len) {
             u32* p = A + blk;
             u32* q = p + half;
 
-            u32 w = 1;
             u32 j = 0;
+            u32 idx = 0;
 
-            // 4-way unroll
-            for (; j + 4 <= half; j += 4) {
-                const u32 w0 = w;
-                const u32 w1 = mul_mod_barrett(w0, wlen, mod, im);
-                const u32 w2 = mul_mod_barrett(w1, wlen, mod, im);
-                const u32 w3 = mul_mod_barrett(w2, wlen, mod, im);
-                w = mul_mod_barrett(w3, wlen, mod, im);
+            // 4-way unroll: load w from table, no w update mul
+            for (; j + 4 <= half; j += 4, idx += 4 * step) {
+                const u32 w0 = RT[idx];
+                const u32 w1 = RT[idx + step];
+                const u32 w2 = RT[idx + 2 * step];
+                const u32 w3 = RT[idx + 3 * step];
 
                 const u32 u0 = p[j + 0];
                 const u32 u1 = p[j + 1];
@@ -289,14 +290,13 @@ inline void ntt_cached(std::size_t prime_idx, std::vector<u32>& a, bool invert) 
             }
 
             // tail
-            for (; j < half; ++j) {
+            for (; j < half; ++j, idx += step) {
+                const u32 w = RT[idx];
                 const u32 u = p[j];
                 const u32 v = barrett_reduce_u64((u64)w * (u64)q[j], mod, im);
 
                 p[j] = add_mod_lazy2(u, v, mod2);
                 q[j] = sub_mod_lazy2(u, v, mod, mod2);
-
-                w = mul_mod_barrett(w, wlen, mod, im);
             }
         }
     }
@@ -305,10 +305,10 @@ inline void ntt_cached(std::size_t prime_idx, std::vector<u32>& a, bool invert) 
         const int logn = __builtin_ctz((unsigned)n);
         const u32 inv_n = C.inv_n_by_log[logn];
 
-        // Normalize from [0, 2*mod) to [0, mod), then scale by inv_n -> [0, mod)
+        // Normalize [0,2mod) -> [0,mod), then scale to [0,mod)
         for (u32 i = 0; i < n; ++i) {
             u32 x = A[i];
-            if (x >= mod) x -= mod; // now < mod
+            if (x >= mod) x -= mod;
             A[i] = barrett_reduce_u64((u64)x * (u64)inv_n, mod, im);
         }
     }
