@@ -449,6 +449,31 @@ inline const GarnerPrecomp& garner_precomp() {
     return pc;
 }
 
+// Forward decl for CRT3Plan
+inline u128 crt3_u128(u32 r0, u32 r1, u32 r2,
+                      u32 m0, u32 m1, u32 m2,
+                      u32 inv_m0_mod_m1, u32 inv_m01_mod_m2,
+                      u128 M01);
+
+// Decide how many NTT primes are needed to cover coefficient bound.
+// bound ~ min(n,m) * (p-1)^2; we use log2 to compare.
+inline std::size_t select_prime_count(u64 p, std::size_t min_dim) {
+    if (min_dim == 0) return 3; // unused path guard
+
+    const double log_bound = std::log2(static_cast<double>(min_dim)) +
+                             2.0 * std::log2(static_cast<double>(p));
+
+    static const double log_prod3 = []() {
+        double s = 0.0;
+        for (int i = 0; i < 3; ++i) s += std::log2(static_cast<double>(kNTT[i].mod));
+        return s;
+    }();
+
+    // two bits of slack to be conservative
+    if (log_bound + 2.0 <= log_prod3) return 3;
+    return kNTT.size(); // fall back to all primes (5 today)
+}
+
 // -------------------- [CRT5] specialized CRT combiner for exactly 5 NTT primes --------------------
 struct CRT5Precomp {
     static constexpr int K = 5;
@@ -492,6 +517,33 @@ inline const CRT5Precomp& crt5_precomp() {
     static const CRT5Precomp pc;
     return pc;
 }
+
+// CRT for first 3 primes -> modulo target p (u64)
+struct CRT3Plan {
+    u64 p = 0;
+    std::array<u32, 3> m{};
+    u32 inv_m0_mod_m1 = 0;
+    u32 inv_m01_mod_m2 = 0;
+    u128 M01 = 0;
+
+    CRT3Plan() = default;
+    explicit CRT3Plan(u64 mod_p) : p(mod_p) {
+        const auto& pc = crt5_precomp(); // reuse first three parameters
+        for (int i = 0; i < 3; ++i) m[i] = pc.m[i];
+        inv_m0_mod_m1 = pc.inv_m0_mod_m1;
+        inv_m01_mod_m2 = pc.inv_m01_mod_m2;
+        M01 = pc.M01;
+    }
+
+    inline u64 combine_to_mod_p(const u32* r3) const {
+        const auto& pc = crt5_precomp();
+        u128 a = crt3_u128(r3[0], r3[1], r3[2],
+                           pc.m[0], pc.m[1], pc.m[2],
+                           pc.inv_m0_mod_m1, pc.inv_m01_mod_m2,
+                           pc.M01);
+        return static_cast<u64>(a % static_cast<u128>(p));
+    }
+};
 
 // CRT for 3 primes -> u128 in [0, m0*m1*m2)
 inline u128 crt3_u128(u32 r0, u32 r1, u32 r2,
@@ -747,9 +799,10 @@ public:
         const std::size_t n = c_.size();
         const std::size_t m = g.c_.size();
         const std::size_t need = n + m - 1;
+        const std::size_t min_dim = std::min(n, m);
 
         // 小规模继续用朴素（避免 NTT 常数）
-        if (need <= 256 || std::min(n, m) <= 64) {
+        if (need <= 256 || min_dim <= 64) {
             std::vector<Fp> out(need, F.zero());
             for (std::size_t i = 0; i < n; ++i) {
                 if (c_[i].v == 0) continue;
@@ -764,22 +817,23 @@ public:
         }
 
         const u64 p = F.modulus();
+        const std::size_t prime_count = detail::select_prime_count(p, min_dim);
 
 #ifndef NDEBUG
         // Debug guard: ensure CRT product covers coefficient bound
-        const double log2_bound = std::log2(static_cast<double>(std::min(n, m))) +
+        const double log2_bound = std::log2(static_cast<double>(min_dim)) +
                                   2.0 * std::log2(static_cast<double>(p));
         double log2_M = 0.0;
-        for (const auto& prm : detail::kNTT) {
-            log2_M += std::log2(static_cast<double>(prm.mod));
+        for (std::size_t i = 0; i < prime_count; ++i) {
+            log2_M += std::log2(static_cast<double>(detail::kNTT[i].mod));
         }
         assert(log2_M > log2_bound + 2.0);
 #endif
 
         // residues[k] will be reused as fa buffer/output for each prime
-        std::vector<std::vector<detail::u32>> residues(detail::kNTT.size());
+        std::vector<std::vector<detail::u32>> residues(prime_count);
 
-        for (std::size_t k = 0; k < detail::kNTT.size(); ++k) {
+        for (std::size_t k = 0; k < prime_count; ++k) {
             const auto prm = detail::kNTT[k];
 
             std::vector<detail::u32> a32(n), b32(m);
@@ -802,18 +856,28 @@ public:
         }
 
         std::vector<Fp> out(need, F.zero());
-        pf::detail::CRT5Plan crt_plan(p);
+        if (prime_count <= 3) {
+            pf::detail::CRT3Plan crt_plan(p);
+            std::array<detail::u32, 3> r{};
 
-        // [small alloc win] avoid per-call vector for r
-        std::array<detail::u32, 5> r{};
-        static_assert(detail::kNTT.size() == 5, "CRT5Plan assumes 5 NTT primes");
-
-        for (std::size_t idx = 0; idx < need; ++idx) {
-            for (std::size_t k = 0; k < detail::kNTT.size(); ++k) {
-                r[k] = residues[k][idx];
+            for (std::size_t idx = 0; idx < need; ++idx) {
+                for (std::size_t k = 0; k < 3; ++k) {
+                    r[k] = residues[k][idx];
+                }
+                u64 val = crt_plan.combine_to_mod_p(r.data());
+                out[idx] = Fp{val};
             }
-            u64 val = crt_plan.combine_to_mod_p(r.data());
-            out[idx] = Fp{val};
+        } else {
+            pf::detail::CRT5Plan crt_plan(p);
+            std::array<detail::u32, 5> r{};
+
+            for (std::size_t idx = 0; idx < need; ++idx) {
+                for (std::size_t k = 0; k < prime_count; ++k) {
+                    r[k] = residues[k][idx];
+                }
+                u64 val = crt_plan.combine_to_mod_p(r.data());
+                out[idx] = Fp{val};
+            }
         }
 
         FpPoly res(F, std::move(out));
@@ -1062,9 +1126,10 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
     const size_type full_need = an + bn - 1;
     const size_type out_need = std::min<size_type>(k, full_need);
     if (out_need == 0) return FpPoly(F);
+    const size_type min_dim = std::min(an, bn);
 
     // 小规模：直接 O(k^2) 低位乘（只算 i+j < out_need）
-    if (out_need <= 256 || std::min(an, bn) <= 64) {
+    if (out_need <= 256 || min_dim <= 64) {
         std::vector<Fp> out(out_need, F.zero());
         for (size_type i = 0; i < an; ++i) {
             const Fp ai = a.c_[i];
@@ -1083,17 +1148,12 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
 
     // 大规模：NTT/CRT，但只对低位需要的部分做输入截断，并且只合并 out_need 个系数
     const u64 p = F.modulus();
-
-    // [CRT5] build plan once
-    pf::detail::CRT5Plan crt_plan(p);
-
-    constexpr std::size_t K = pf::detail::kNTT.size();
-    static_assert(K == 5, "mul_trunc_poly CRT specialization assumes kNTT.size()==5");
+    const std::size_t prime_count = pf::detail::select_prime_count(p, min_dim);
 
     std::vector<std::vector<pf::detail::u32>> residues;
-    residues.resize(K);
+    residues.resize(prime_count);
 
-    for (std::size_t idxp = 0; idxp < K; ++idxp) {
+    for (std::size_t idxp = 0; idxp < prime_count; ++idxp) {
         const auto prm = pf::detail::kNTT[idxp];
 
         std::vector<pf::detail::u32> A32(an), B32(bn);
@@ -1114,14 +1174,28 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
     }
 
     std::vector<Fp> out(out_need, F.zero());
-    std::array<pf::detail::u32, 5> r{};   // [CRT5] fixed size
+    if (prime_count <= 3) {
+        pf::detail::CRT3Plan crt_plan(p);
+        std::array<pf::detail::u32, 3> r{};
 
-    for (size_type i = 0; i < out_need; ++i) {
-        for (std::size_t idxp = 0; idxp < K; ++idxp) {
-            r[idxp] = residues[idxp][i];
+        for (size_type i = 0; i < out_need; ++i) {
+            for (std::size_t idxp = 0; idxp < 3; ++idxp) {
+                r[idxp] = residues[idxp][i];
+            }
+            const u64 val = crt_plan.combine_to_mod_p(r.data());
+            out[i] = Fp{val};
         }
-        const u64 val = crt_plan.combine_to_mod_p(r.data());  // [CRT5] replace Garner
-        out[i] = Fp{val};
+    } else {
+        pf::detail::CRT5Plan crt_plan(p);
+        std::array<pf::detail::u32, 5> r{};
+
+        for (size_type i = 0; i < out_need; ++i) {
+            for (std::size_t idxp = 0; idxp < prime_count; ++idxp) {
+                r[idxp] = residues[idxp][i];
+            }
+            const u64 val = crt_plan.combine_to_mod_p(r.data());
+            out[i] = Fp{val};
+        }
     }
 
     FpPoly res(F, std::move(out));

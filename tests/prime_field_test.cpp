@@ -3,10 +3,12 @@
 #include <cassert>
 #include <random>
 #include <iostream>
+#include <limits>
 
 using pf::Fp;
 using pf::FpCtx;
 using pf::u64;
+using pf::u128;
 
 static void test_small_handcrafted() {
     FpCtx F(17);
@@ -108,6 +110,48 @@ static void test_random_identities(u64 p, int rounds, std::uint64_t seed) {
     }
 }
 
+static void test_mersenne_mul(u64 p, int rounds, std::uint64_t seed) {
+    FpCtx F(p);
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<u64> dist(0, p - 1);
+
+    auto mul_ref = [&](u64 a, u64 b) -> u64 {
+        return static_cast<u64>(static_cast<u128>(a) * static_cast<u128>(b) % static_cast<u128>(p));
+    };
+
+    for (int i = 0; i < rounds; ++i) {
+        u64 a = dist(rng);
+        u64 b = dist(rng);
+        u64 ref = mul_ref(a, b);
+        Fp got = F.mul(F.from_uint(a), F.from_uint(b));
+        if (got.v != ref) {
+            std::cerr << "Mersenne mul mismatch: p=" << p
+                      << ", a=" << a << ", b=" << b
+                      << ", got=" << got.v << ", expected=" << ref << "\n";
+            std::abort();
+        }
+    }
+
+    // from_uint reduction for values >= p
+    for (int i = 0; i < 1000; ++i) {
+        u64 raw = dist(rng) + p; // in [p, 2p)
+        u64 ref = raw % p;
+        if (F.from_uint(raw).v != ref) {
+            std::cerr << "from_uint mismatch for Mersenne p=" << p
+                      << ", raw=" << raw << ", expected=" << ref << "\n";
+            std::abort();
+        }
+    }
+}
+
+static void test_mersenne_primes() {
+    const u64 m31 = (1ULL << 31) - 1;
+    const u64 m61 = (1ULL << 61) - 1;
+
+    test_mersenne_mul(m31, 20000, 0x12345678ULL);
+    test_mersenne_mul(m61, 20000, 0x9abcdef0ULL);
+}
+
 int main() {
     test_small_handcrafted();
     test_mod2();
@@ -117,6 +161,9 @@ int main() {
 
     // 也可以测一个较大的素数（2^61-1 是著名梅森素数）
     test_random_identities(2305843009213693951ULL, 20000, 7654321);
+
+    // 梅森素数特化路径
+    test_mersenne_primes();
 
     std::cout << "All prime field tests passed.\n";
     return 0;

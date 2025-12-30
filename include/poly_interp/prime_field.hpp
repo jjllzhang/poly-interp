@@ -33,11 +33,26 @@ inline std::ostream& operator<<(std::ostream& os, const Fp& x) {
 // 素域上下文：只保存模数 p（假设 p 是素数）。
 struct FpCtx {
     u64 p;
+    bool is_mersenne_ = false;
+    unsigned mersenne_k_ = 0; // p = 2^k - 1
+    u64 mersenne_mask_ = 0;
 
     // 不做素性测试；只做最基本合法性检查。
     explicit FpCtx(u64 prime_mod) : p(prime_mod) {
         if (p < 2) {
             throw std::invalid_argument("FpCtx: modulus p must be >= 2");
+        }
+
+        // Detect p = 2^k - 1 (Mersenne); used for fast reduction paths.
+        is_mersenne_ = ((p & (p + 1)) == 0);
+        if (is_mersenne_) {
+            mersenne_mask_ = p; // == (1ULL << k) - 1
+            mersenne_k_ = 64U - static_cast<unsigned>(__builtin_clzll(p));
+            if (mersenne_k_ >= 64U) { // avoid undefined shift when p == 2^64-1
+                is_mersenne_ = false;
+                mersenne_k_ = 0;
+                mersenne_mask_ = 0;
+            }
         }
     }
 
@@ -49,11 +64,23 @@ struct FpCtx {
 
     // 将整数规约到 [0, p)
     Fp from_uint(u64 x) const noexcept {
+        if (is_mersenne_) {
+            return Fp{ reduce_mersenne(static_cast<u128>(x)) };
+        }
         return Fp{ x % p };
     }
 
     // 将有符号整数规约到 [0, p)
     Fp from_int(std::int64_t x) const noexcept {
+        if (is_mersenne_) {
+            i128 xi = static_cast<i128>(x);
+            bool neg = xi < 0;
+            u128 mag = neg ? static_cast<u128>(-xi) : static_cast<u128>(xi);
+            u64 r = reduce_mersenne(mag);
+            if (neg && r != 0) r = p - r;
+            return Fp{r};
+        }
+
         i128 r = static_cast<i128>(x) % static_cast<i128>(p);
         if (r < 0) r += static_cast<i128>(p);
         return Fp{ static_cast<u64>(r) };
@@ -90,7 +117,7 @@ struct FpCtx {
     // a * b (mod p)
     Fp mul(Fp a, Fp b) const noexcept {
         u128 t = static_cast<u128>(a.v) * static_cast<u128>(b.v);
-        u64 r = static_cast<u64>(t % p);
+        u64 r = is_mersenne_ ? reduce_mersenne(t) : static_cast<u64>(t % p);
         return Fp{r};
     }
 
@@ -172,6 +199,18 @@ struct FpCtx {
         }
     }
 
+private:
+    // Fast reduction for Mersenne prime p = 2^k - 1.
+    inline u64 reduce_mersenne(u128 x) const noexcept {
+        // Fold: (low k bits) + (rest), repeat once; final result < 2^k + 1 <= 2p
+        const u128 mask = static_cast<u128>(mersenne_mask_);
+        const unsigned k = mersenne_k_;
+
+        u128 t = (x & mask) + (x >> k);
+        u64 r = static_cast<u64>((t & mask) + (t >> k));
+        if (r >= mersenne_mask_) r -= mersenne_mask_;
+        return r;
+    }
 };
 
 // 方便用的比较运算（不依赖 ctx；仅比较存储值）
