@@ -248,6 +248,24 @@ static void test_interpolate_subproduct_tree_vs_naive() {
     }
 }
 
+static void test_interpolate_roundtrip(u64 p) {
+    pf::FpCtx F(p);
+    std::mt19937_64 rng(777);
+
+    const std::size_t n = 4096;
+    std::vector<pf::Fp> xs(n), ys(n);
+
+    for (std::size_t i = 0; i < n; ++i) xs[i] = F.from_uint((pf::u64)(i + 1));
+    for (std::size_t i = 0; i < n; ++i) ys[i] = F.from_uint((pf::u64)rng());
+
+    auto tree = pf::FpPoly::SubproductTree::build(F, xs);
+    pf::FpPoly poly = pf::FpPoly::interpolate_subproduct_tree(tree, ys);
+
+    std::vector<pf::Fp> got = poly.multipoint_eval(tree);
+    assert(got.size() == ys.size());
+    for (std::size_t i = 0; i < n; ++i) assert(got[i] == ys[i]);
+}
+
 static void test_poly_operator_overloads() {
     FpCtx F(17);
     FpPoly f(F, {3, 5, 0, 2});
@@ -317,18 +335,14 @@ static void test_batch_inv() {
 
 static pf::FpPoly mul_naive_ref(const pf::FpPoly& a, const pf::FpPoly& b) {
     const pf::FpCtx& F = a.ctx();
+    if (a.is_zero() || b.is_zero()) return pf::FpPoly(F);
     const std::size_t n = a.coeffs().size();
     const std::size_t m = b.coeffs().size();
-    if (n == 0 || m == 0) return pf::FpPoly(F);
 
     std::vector<pf::Fp> out(n + m - 1, F.zero());
     for (std::size_t i = 0; i < n; ++i) {
-        pf::Fp ai = a.coeff(i);
-        if (ai.v == 0) continue;
         for (std::size_t j = 0; j < m; ++j) {
-            pf::Fp bj = b.coeff(j);
-            if (bj.v == 0) continue;
-            out[i + j] = F.add(out[i + j], F.mul(ai, bj));
+            out[i + j] = F.add(out[i + j], F.mul(a.coeffs()[i], b.coeffs()[j]));
         }
     }
 
@@ -355,6 +369,40 @@ static void test_mul_ntt_crt_correctness() {
         auto c2 = mul_naive_ref(a, b); // 参考朴素
 
         assert(c1 == c2);
+    }
+}
+
+static void test_mul_eval_consistency(u64 p) {
+    pf::FpCtx F(p);
+    std::mt19937_64 rng(123456);
+
+    auto rndFp = [&]() -> pf::Fp { return F.from_uint((pf::u64)rng()); };
+
+    for (int tc = 0; tc < 80; ++tc) {
+        // 让规模跨过阈值，逼迫走 NTT/CRT 路径
+        std::size_t n = 400 + (rng() % 800);
+        std::size_t m = 400 + (rng() % 800);
+
+        std::vector<pf::Fp> A(n), B(m);
+        for (std::size_t i = 0; i < n; ++i) A[i] = rndFp();
+        for (std::size_t j = 0; j < m; ++j) B[j] = rndFp();
+
+        // 偶尔用极端系数 (p-1) 压一压范围
+        if (tc % 10 == 0) {
+            for (auto& x : A) x = F.sub(F.zero(), F.one());
+            for (auto& x : B) x = F.sub(F.zero(), F.one());
+        }
+
+        pf::FpPoly a(F, A), b(F, B);
+        pf::FpPoly c = a.mul(b);
+
+        // 多取几个随机点
+        for (int rep = 0; rep < 16; ++rep) {
+            pf::Fp x = F.from_uint((pf::u64)(rng() % 100000 + 1));
+            pf::Fp lhs = c.eval(x);
+            pf::Fp rhs = F.mul(a.eval(x), b.eval(x));
+            assert(lhs == rhs);
+        }
     }
 }
 
@@ -393,9 +441,13 @@ int main() {
     test_multipoint_eval_tree_vs_naive();
     test_interpolate_lagrange_naive();
     test_interpolate_subproduct_tree_vs_naive();
+    test_interpolate_roundtrip((1ULL<<31) - 1);
+    test_interpolate_roundtrip((1ULL<<61) - 1);
     test_poly_operator_overloads();
     test_remainder_tree_leaf_values();
     test_batch_inv();
+    test_mul_eval_consistency((1ULL<<31) - 1);
+    test_mul_eval_consistency((1ULL<<61) - 1);
     test_mul_ntt_crt_correctness();
     test_fast_mod_matches_slow();
 

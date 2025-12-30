@@ -14,6 +14,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cmath>
 
 
 namespace pf {
@@ -30,9 +31,8 @@ struct NTTPrime {
     int max_base; // supports length up to 2^max_base
 };
 
-// 6 primes => product ~ 2^178, 足够覆盖 n<=2^20, p<2^64 的系数上界（保守）
-static constexpr std::array<NTTPrime, 6> kNTT = {{
-    {167772161u, 3u, 25},     // 5*2^25+1
+// 5 primes => product ~ 2^148.29, 覆盖 n<=2^20、p<2^64 的卷积上界
+static constexpr std::array<NTTPrime, 5> kNTT = {{
     {469762049u, 3u, 26},     // 7*2^26+1
     {754974721u, 11u, 24},    // 45*2^24+1
     {998244353u, 3u, 23},     // 119*2^23+1
@@ -352,119 +352,111 @@ inline const GarnerPrecomp& garner_precomp() {
     return pc;
 }
 
-// -------------------- [CRT6] specialized CRT combiner for exactly 6 NTT primes --------------------
-struct CRT6Precomp {
-    static constexpr int K = 6;
+// -------------------- [CRT5] specialized CRT combiner for exactly 5 NTT primes --------------------
+struct CRT5Precomp {
+    static constexpr int K = 5;
     std::array<u32, K> m{};
 
-    // group0: m0,m1,m2
+    // groupA: m0,m1,m2
     u32 inv_m0_mod_m1 = 0;
     u32 inv_m01_mod_m2 = 0;
     u128 M01 = 0;
     u128 M012 = 0;
 
-    // group1: m3,m4,m5
+    // groupB: m3,m4
     u32 inv_m3_mod_m4 = 0;
-    u32 inv_m34_mod_m5 = 0;
     u128 M34 = 0;
-    u128 M345 = 0;
 
-    // inverses of M012 mod m3/m4/m5 (for the final merge step)
+    // inv(M012) mod m3/m4
     u32 inv_M012_mod_m3 = 0;
     u32 inv_M012_mod_m4 = 0;
-    u32 inv_M012_mod_m5 = 0;
 
-    CRT6Precomp() {
-        static_assert(kNTT.size() == 6, "CRT6Precomp requires exactly 6 NTT primes");
+    CRT5Precomp() {
+        static_assert(kNTT.size() == 5, "CRT5Precomp requires exactly 5 NTT primes");
 
         for (int i = 0; i < K; ++i) m[i] = kNTT[i].mod;
 
-        // group0
-        // inv(m0 mod m1) mod m1
+        // groupA
         inv_m0_mod_m1 = inv_mod((u32)(m[0] % m[1]), m[1]);
         M01 = (u128)m[0] * (u128)m[1];
         inv_m01_mod_m2 = inv_mod((u32)(M01 % m[2]), m[2]);
         M012 = M01 * (u128)m[2];
 
-        // group1
+        // groupB
         inv_m3_mod_m4 = inv_mod((u32)(m[3] % m[4]), m[4]);
         M34 = (u128)m[3] * (u128)m[4];
-        inv_m34_mod_m5 = inv_mod((u32)(M34 % m[5]), m[5]);
-        M345 = M34 * (u128)m[5];
 
-        // inverses for merging: inv(M012 mod mi) mod mi, mi is prime
         inv_M012_mod_m3 = inv_mod((u32)(M012 % m[3]), m[3]);
         inv_M012_mod_m4 = inv_mod((u32)(M012 % m[4]), m[4]);
-        inv_M012_mod_m5 = inv_mod((u32)(M012 % m[5]), m[5]);
     }
 };
 
-inline const CRT6Precomp& crt6_precomp() {
-    static const CRT6Precomp pc;
+inline const CRT5Precomp& crt5_precomp() {
+    static const CRT5Precomp pc;
     return pc;
 }
 
-// CRT for 3 primes (u128 result in [0, m0*m1*m2))
+// CRT for 3 primes -> u128 in [0, m0*m1*m2)
 inline u128 crt3_u128(u32 r0, u32 r1, u32 r2,
                       u32 m0, u32 m1, u32 m2,
                       u32 inv_m0_mod_m1, u32 inv_m01_mod_m2,
                       u128 M01) {
     // x = r0 + m0 * t1  (mod m0*m1)
-    u32 t1 = r1 >= r0 ? (r1 - r0) : (r1 + m1 - (r0 % m1));
+    u32 t1 = (r1 >= r0) ? (r1 - r0) : (r1 + m1 - (u32)(r0 % m1));
     t1 = (u32)((u64)t1 * inv_m0_mod_m1 % m1);
     u128 x = (u128)r0 + (u128)m0 * (u128)t1;
 
     // x = x + (m0*m1) * t2  (mod m0*m1*m2)
     u32 x_mod_m2 = (u32)(x % m2);
-    u32 t2 = r2 >= x_mod_m2 ? (r2 - x_mod_m2) : (r2 + m2 - x_mod_m2);
+    u32 t2 = (r2 >= x_mod_m2) ? (r2 - x_mod_m2) : (r2 + m2 - x_mod_m2);
     t2 = (u32)((u64)t2 * inv_m01_mod_m2 % m2);
     x += M01 * (u128)t2;
     return x;
 }
 
-// Plan object bound to a specific target modulus p (M31/M61)
-struct CRT6Plan {
+// CRT for 2 primes -> u128 in [0, m3*m4)
+inline u128 crt2_u128(u32 r3, u32 r4, u32 m3, u32 m4, u32 inv_m3_mod_m4) {
+    u32 t = (r4 >= r3) ? (r4 - r3) : (r4 + m4 - (u32)(r3 % m4));
+    t = (u32)((u64)t * inv_m3_mod_m4 % m4);
+    return (u128)r3 + (u128)m3 * (u128)t;
+}
+
+struct CRT5Plan {
     u64 p = 0;
     u64 M012_mod_p = 0;
 
-    CRT6Plan() = default;
-    explicit CRT6Plan(u64 mod_p) : p(mod_p) {
-        const auto& pc = crt6_precomp();
+    CRT5Plan() = default;
+    explicit CRT5Plan(u64 mod_p) : p(mod_p) {
+        const auto& pc = crt5_precomp();
         M012_mod_p = (u64)(pc.M012 % (u128)p);
     }
 
-    inline u64 combine_to_mod_p(const u32* r6) const {
-        const auto& pc = crt6_precomp();
+    inline u64 combine_to_mod_p(const u32* r5) const {
+        const auto& pc = crt5_precomp();
 
         // a in [0, M012)
-        const u128 a = crt3_u128(r6[0], r6[1], r6[2],
+        const u128 a = crt3_u128(r5[0], r5[1], r5[2],
                                  pc.m[0], pc.m[1], pc.m[2],
                                  pc.inv_m0_mod_m1, pc.inv_m01_mod_m2,
                                  pc.M01);
 
-        // compute t modulo m3,m4,m5: t ≡ (r - a) * inv(M012) (mod mi)
+        // t ≡ (r - a) * inv(M012) (mod m3, m4)
         const u32 a_mod_m3 = (u32)(a % pc.m[3]);
         const u32 a_mod_m4 = (u32)(a % pc.m[4]);
-        const u32 a_mod_m5 = (u32)(a % pc.m[5]);
 
-        u32 t3 = r6[3] >= a_mod_m3 ? (r6[3] - a_mod_m3) : (r6[3] + pc.m[3] - a_mod_m3);
-        u32 t4 = r6[4] >= a_mod_m4 ? (r6[4] - a_mod_m4) : (r6[4] + pc.m[4] - a_mod_m4);
-        u32 t5 = r6[5] >= a_mod_m5 ? (r6[5] - a_mod_m5) : (r6[5] + pc.m[5] - a_mod_m5);
+        u32 t3 = (r5[3] >= a_mod_m3) ? (r5[3] - a_mod_m3) : (r5[3] + pc.m[3] - a_mod_m3);
+        u32 t4 = (r5[4] >= a_mod_m4) ? (r5[4] - a_mod_m4) : (r5[4] + pc.m[4] - a_mod_m4);
 
         t3 = (u32)((u64)t3 * pc.inv_M012_mod_m3 % pc.m[3]);
         t4 = (u32)((u64)t4 * pc.inv_M012_mod_m4 % pc.m[4]);
-        t5 = (u32)((u64)t5 * pc.inv_M012_mod_m5 % pc.m[5]);
 
-        // t in [0, M345)
-        const u128 t = crt3_u128(t3, t4, t5,
-                                 pc.m[3], pc.m[4], pc.m[5],
-                                 pc.inv_m3_mod_m4, pc.inv_m34_mod_m5,
-                                 pc.M34);
+        const u128 t = crt2_u128(t3, t4, pc.m[3], pc.m[4], pc.inv_m3_mod_m4);
 
-        // x = a + M012 * t   (mod p)
+        // x = a + M012 * t (mod p)
         const u64 a_mod_p = (u64)(a % (u128)p);
         const u64 t_mod_p = (u64)(t % (u128)p);
         const u64 add = (u64)((u128)M012_mod_p * (u128)t_mod_p % (u128)p);
+
         u64 res = a_mod_p + add;
         if (res >= p) res -= p;
         return res;
@@ -676,6 +668,17 @@ public:
 
         const u64 p = F.modulus();
 
+#ifndef NDEBUG
+        // Debug guard: ensure CRT product covers coefficient bound
+        const double log2_bound = std::log2(static_cast<double>(std::min(n, m))) +
+                                  2.0 * std::log2(static_cast<double>(p));
+        double log2_M = 0.0;
+        for (const auto& prm : detail::kNTT) {
+            log2_M += std::log2(static_cast<double>(prm.mod));
+        }
+        assert(log2_M > log2_bound + 2.0);
+#endif
+
         // residues[k] will be reused as fa buffer/output for each prime
         std::vector<std::vector<detail::u32>> residues(detail::kNTT.size());
 
@@ -693,11 +696,11 @@ public:
         }
 
         std::vector<Fp> out(need, F.zero());
-        pf::detail::CRT6Plan crt_plan(p);
+        pf::detail::CRT5Plan crt_plan(p);
 
         // [small alloc win] avoid per-call vector for r
-        std::array<detail::u32, 6> r{};
-        static_assert(detail::kNTT.size() == 6, "CRT6Plan assumes 6 NTT primes");
+        std::array<detail::u32, 5> r{};
+        static_assert(detail::kNTT.size() == 5, "CRT5Plan assumes 5 NTT primes");
 
         for (std::size_t idx = 0; idx < need; ++idx) {
             for (std::size_t k = 0; k < detail::kNTT.size(); ++k) {
@@ -975,11 +978,11 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
     // 大规模：NTT/CRT，但只对低位需要的部分做输入截断，并且只合并 out_need 个系数
     const u64 p = F.modulus();
 
-    // [CRT6] build plan once
-    pf::detail::CRT6Plan crt_plan(p);
+    // [CRT5] build plan once
+    pf::detail::CRT5Plan crt_plan(p);
 
     constexpr std::size_t K = pf::detail::kNTT.size();
-    static_assert(K == 6, "mul_trunc_poly CRT specialization assumes kNTT.size()==6");
+    static_assert(K == 5, "mul_trunc_poly CRT specialization assumes kNTT.size()==5");
 
     std::vector<std::vector<pf::detail::u32>> residues;
     residues.resize(K);
@@ -996,13 +999,13 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
     }
 
     std::vector<Fp> out(out_need, F.zero());
-    std::array<pf::detail::u32, 6> r{};   // [CRT6] fixed size
+    std::array<pf::detail::u32, 5> r{};   // [CRT5] fixed size
 
     for (size_type i = 0; i < out_need; ++i) {
         for (std::size_t idxp = 0; idxp < K; ++idxp) {
             r[idxp] = residues[idxp][i];
         }
-        const u64 val = crt_plan.combine_to_mod_p(r.data());  // [CRT6] replace Garner
+        const u64 val = crt_plan.combine_to_mod_p(r.data());  // [CRT5] replace Garner
         out[i] = Fp{val};
     }
 

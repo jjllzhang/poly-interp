@@ -57,7 +57,7 @@ endif()
 # Convenience target: build + run bench to data/bench.csv
 add_custom_target(run_bench
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_SOURCE_DIR}/data
-  COMMAND interp_bench --prime=all --min_pow=10 --max_pow=18 --repeats=3 --csv=1
+  COMMAND interp_bench --prime=all --min_pow=10 --max_pow=20 --repeats=3 --csv=1
           > ${CMAKE_CURRENT_SOURCE_DIR}/data/bench.csv
   DEPENDS interp_bench
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
