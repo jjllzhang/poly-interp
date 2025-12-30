@@ -48,7 +48,7 @@ target_link_libraries(interp_bench PRIVATE poly_interp)
 
 # Bench: prefer Release-like flags
 if (NOT MSVC)
-  target_compile_options(interp_bench PRIVATE -O3 -DNDEBUG)
+  target_compile_options(interp_bench PRIVATE -O3 -DNDEBUG -march=native)
 else()
   target_compile_options(interp_bench PRIVATE /O2)
   target_compile_definitions(interp_bench PRIVATE NDEBUG)

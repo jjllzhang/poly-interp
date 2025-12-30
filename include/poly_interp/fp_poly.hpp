@@ -49,6 +49,21 @@ inline u32 add_mod(u32 a, u32 b, u32 mod) {
 inline u32 sub_mod(u32 a, u32 b, u32 mod) {
     return (a >= b) ? (a - b) : (a + mod - b);
 }
+// -------------------- [LAZY REDUCTION] keep values in [0, 2*mod) --------------------
+inline u32 add_mod_lazy2(u32 a, u32 b, u32 mod2) {
+    // pre: a in [0, mod2), b in [0, mod)
+    u32 s = a + b;            // < 3*mod < 2^32
+    if (s >= mod2) s -= mod2;
+    return s;                 // in [0, mod2)
+}
+
+inline u32 sub_mod_lazy2(u32 a, u32 b, u32 mod, u32 mod2) {
+    // pre: a in [0, mod2), b in [0, mod)
+    // use a + mod - b to avoid potential overflow of a + mod2
+    u32 s = a + mod - b;      // < 3*mod < 2^32
+    if (s >= mod2) s -= mod2;
+    return s;                 // in [0, mod2)
+}
 // -------------------- [BARRETT] fast mod for u64 x with 32-bit prime mod --------------------
 inline u32 barrett_reduce_u64(u64 x, u32 mod, u64 im) {
     // im = floor(2^64 / mod)
@@ -210,31 +225,78 @@ inline void ntt_cached(std::size_t prime_idx, std::vector<u32>& a, bool invert) 
     const u32 n = (u32)a.size();
     NTTCache& C = ensure_ntt_cache(prime_idx, n);
     const u32 mod = C.mod;
+    const u32 mod2 = mod + mod;     // safe for your primes (< 2^32)
+    const u64 im = C.barrett_im;
+    const u32 cache_n = C.cache_n;
 
-    // [BITREV CACHE] cached bit-reversal permutation
+#ifndef NDEBUG
+    // In debug, make sure inputs are in [0, mod) (cheap fix if slightly out)
+    for (u32 i = 0; i < n; ++i) {
+        if (a[i] >= mod) a[i] %= mod;
+    }
+#endif
+
+    // [BITREV CACHE]
     const auto& rev = bitrev_table(n);
     for (u32 i = 0; i < n; ++i) {
         const u32 j = rev[i];
         if (i < j) std::swap(a[i], a[j]);
     }
 
-    // Use cached root table sized cache_n (>= n).
-    // For stage len, wlen = g^((mod-1)/len) = base^(cache_n/len).
-    const u32 cache_n = C.cache_n;
+    u32* A = a.data();
 
     for (u32 len = 2; len <= n; len <<= 1) {
         const u32 half = len >> 1;
         const u32 step = cache_n / len;
         const u32 wlen = invert ? C.iroot[step] : C.root[step];
 
-        for (u32 i = 0; i < n; i += len) {
+        for (u32 blk = 0; blk < n; blk += len) {
+            u32* p = A + blk;
+            u32* q = p + half;
+
             u32 w = 1;
-            for (u32 j = 0; j < half; ++j) {
-                const u32 u = a[i + j];
-                const u32 v = barrett_reduce_u64((u64)w * (u64)a[i + j + half], mod, C.barrett_im);
-                a[i + j] = add_mod(u, v, mod);
-                a[i + j + half] = sub_mod(u, v, mod);
-                w = mul_mod_barrett(w, wlen, mod, C.barrett_im);
+            u32 j = 0;
+
+            // 4-way unroll
+            for (; j + 4 <= half; j += 4) {
+                const u32 w0 = w;
+                const u32 w1 = mul_mod_barrett(w0, wlen, mod, im);
+                const u32 w2 = mul_mod_barrett(w1, wlen, mod, im);
+                const u32 w3 = mul_mod_barrett(w2, wlen, mod, im);
+                w = mul_mod_barrett(w3, wlen, mod, im);
+
+                const u32 u0 = p[j + 0];
+                const u32 u1 = p[j + 1];
+                const u32 u2 = p[j + 2];
+                const u32 u3 = p[j + 3];
+
+                const u32 v0 = barrett_reduce_u64((u64)w0 * (u64)q[j + 0], mod, im);
+                const u32 v1 = barrett_reduce_u64((u64)w1 * (u64)q[j + 1], mod, im);
+                const u32 v2 = barrett_reduce_u64((u64)w2 * (u64)q[j + 2], mod, im);
+                const u32 v3 = barrett_reduce_u64((u64)w3 * (u64)q[j + 3], mod, im);
+
+                p[j + 0] = add_mod_lazy2(u0, v0, mod2);
+                q[j + 0] = sub_mod_lazy2(u0, v0, mod, mod2);
+
+                p[j + 1] = add_mod_lazy2(u1, v1, mod2);
+                q[j + 1] = sub_mod_lazy2(u1, v1, mod, mod2);
+
+                p[j + 2] = add_mod_lazy2(u2, v2, mod2);
+                q[j + 2] = sub_mod_lazy2(u2, v2, mod, mod2);
+
+                p[j + 3] = add_mod_lazy2(u3, v3, mod2);
+                q[j + 3] = sub_mod_lazy2(u3, v3, mod, mod2);
+            }
+
+            // tail
+            for (; j < half; ++j) {
+                const u32 u = p[j];
+                const u32 v = barrett_reduce_u64((u64)w * (u64)q[j], mod, im);
+
+                p[j] = add_mod_lazy2(u, v, mod2);
+                q[j] = sub_mod_lazy2(u, v, mod, mod2);
+
+                w = mul_mod_barrett(w, wlen, mod, im);
             }
         }
     }
@@ -242,8 +304,12 @@ inline void ntt_cached(std::size_t prime_idx, std::vector<u32>& a, bool invert) 
     if (invert) {
         const int logn = __builtin_ctz((unsigned)n);
         const u32 inv_n = C.inv_n_by_log[logn];
+
+        // Normalize from [0, 2*mod) to [0, mod), then scale by inv_n -> [0, mod)
         for (u32 i = 0; i < n; ++i) {
-            a[i] = mul_mod(a[i], inv_n, mod);
+            u32 x = A[i];
+            if (x >= mod) x -= mod; // now < mod
+            A[i] = barrett_reduce_u64((u64)x * (u64)inv_n, mod, im);
         }
     }
 }
