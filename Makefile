@@ -1,4 +1,4 @@
-.PHONY: release debug test bench-interp bench-ops bench-ops-flint bench-flint plot-interp plot-ops plot-ops-flint plot-ops-compare plot-flint clean
+.PHONY: release debug test bench-interp bench-ops bench-ops-flint bench-flint plot-interp plot-interp-compare plot-ops plot-ops-flint plot-ops-compare plot-flint clean
 
 release:
 	cmake --preset release
@@ -41,6 +41,10 @@ bench-flint: release
 
 plot-interp: release
 	cmake --build --preset release --target plot_interp
+
+plot-interp-compare:
+	mkdir -p plots/interp_compare
+	python3 scripts/plot.py data/bench.csv plots/interp_compare --format=interp --compare-interp data/bench_flint.csv --logy
 
 plot-flint: release
 	cmake --build --preset release --target plot_flint

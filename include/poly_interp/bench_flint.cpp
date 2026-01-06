@@ -85,14 +85,15 @@ int main(int argc, char **argv) {
       return 1;
     }
     if (need_header) {
-      csv << "lib,mod,k,n,avg_us\n";
+      csv << "prime,label,n_pow,n,build_tree_ms,interp_avg_ms,interp_min_ms,interp_max_ms,interp_ms_per_point,fingerprint\n";
     }
   }
 
   for (auto [mod_name, mod] : mods) {
-    std::cout << "FLINT nmod_poly_interpolate_nmod_vec_fast  mod=" << mod
-              << " (" << mod_name << ")  k=[" << k_min << "," << k_max << "]"
-              << "  trials=" << trials << " (avg over distinct ys)\n";
+    const std::string prime_label = mod_name;
+    std::cout << "Prime " << mod_name << " (p=" << mod << ")\n";
+    std::cout << "n=2^k, k in [" << k_min << "," << k_max << "], trials=" << trials
+              << " (avg over distinct ys)\n";
 
     uint64_t seed = 123456789ULL ^ (uint64_t)mod;
 
@@ -112,10 +113,26 @@ int main(int argc, char **argv) {
         g_sink ^= nmod_poly_get_coeff_ui(poly, 0);
       }
 
-      double sum_us = 0.0;
+      double sum_interp_ms = 0.0;
+      double min_interp_ms = 1e300;
+      double max_interp_ms = 0.0;
+      double sum_tree_ms = 0.0;
+      ulong fp_acc = 0;
 
       for (int t = 0; t < trials; ++t) {
         fill_ys(ys, mod, seed);
+
+        // subproduct tree build timing via internal API (includes alloc/free)
+        {
+          auto t0 = std::chrono::steady_clock::now();
+          nmod_t ctx;
+          nmod_init(&ctx, mod);
+          mp_ptr* tree = _nmod_poly_tree_alloc(n);
+          _nmod_poly_tree_build(tree, xs.data(), n, ctx);
+          _nmod_poly_tree_free(tree, n);
+          auto t1 = std::chrono::steady_clock::now();
+          sum_tree_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
 
         auto st = std::chrono::steady_clock::now();
         nmod_poly_interpolate_nmod_vec_fast(poly, xs.data(), ys.data(), n);
@@ -128,16 +145,42 @@ int main(int argc, char **argv) {
           d ^= nmod_poly_get_coeff_ui(poly, (ulong)i) + 0x9e3779b9U;
         }
         g_sink ^= d;
+        fp_acc ^= (d + 0x9e3779b97f4a7c15ULL + (fp_acc << 6) + (fp_acc >> 2));
 
-        double us = std::chrono::duration<double, std::micro>(ed - st).count();
-        sum_us += us;
+        double ms = std::chrono::duration<double, std::milli>(ed - st).count();
+        sum_interp_ms += ms;
+        min_interp_ms = std::min(min_interp_ms, ms);
+        max_interp_ms = std::max(max_interp_ms, ms);
       }
 
-      double avg = sum_us / (double)trials;
-      std::cout << "n=" << n << ", avg_us=" << avg << "\n";
+      double avg_interp_ms = sum_interp_ms / (double)trials;
+      double avg_tree_ms = sum_tree_ms / (double)trials;
+      double ms_per_point = avg_interp_ms / (double)n;
+
       if (csv) {
-        csv << "flint," << mod << "," << k << "," << n << "," << avg << "\n";
+        csv
+            << prime_label << "," << prime_label << ","
+            << k << "," << n << ","
+            << std::fixed << std::setprecision(3)
+            << avg_tree_ms << ","
+            << avg_interp_ms << ","
+            << min_interp_ms << ","
+            << max_interp_ms << ","
+            << std::setprecision(9) << ms_per_point << ","
+            << std::hex << fp_acc << std::dec
+            << "\n";
         csv.flush();
+      }
+
+      if (csv_path.empty()) {
+        std::cout
+            << "n=2^" << k << " (" << n << "): "
+            << "build=" << std::fixed << std::setprecision(3) << avg_tree_ms << " ms, "
+            << "interp(avg)=" << avg_interp_ms << " ms "
+            << "(min=" << min_interp_ms << ", max=" << max_interp_ms << "), "
+            << "ms/pt=" << std::setprecision(9) << ms_per_point
+            << ", fp=0x" << std::hex << fp_acc << std::dec
+            << "\n";
       }
 
       nmod_poly_clear(poly);
