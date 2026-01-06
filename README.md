@@ -5,24 +5,27 @@ Lightweight C++17 header-only helpers for prime-field arithmetic and fast polyno
 ## Requirements
 - C++17 compiler with `unsigned __int128` support (GCC/Clang).
 - CMake ≥ 3.20.
+- (Optional, for FLINT baseline bench) `libflint-dev`, `libgmp-dev`.
 
 ## Building
 ```bash
-cmake -S . -B build -DPI_ENABLE_WARNINGS=ON
-cmake --build build
+cmake --preset release          # configure Ninja build in build/release
+cmake --build --preset release --target interp_bench bench_flint
+# or simply: make release
 ```
 
 ### Tests
 ```bash
-cmake --build build --target test
-ctest --test-dir build
+cmake --build --preset release --target test
+ctest --preset release
 ```
 
 ### Benchmarks
-```
-cmake --build build --target run_bench   # writes CSV to data/bench.csv
-cmake --build build --target plot        # optional: requires python3 + scripts/plot.py
-```
+- Interp bench (project implementation): `make bench-interp` → writes `data/bench.csv`.
+- FLINT bench (requires FLINT/GMP): `make bench-flint` → writes `data/bench_flint.csv`.
+- Plotting (requires python3 + pandas + matplotlib):
+  - `make plot-interp` (reads `data/bench.csv`, outputs `plots/interp/`).
+  - `make plot-flint` (reads `data/bench_flint.csv`, outputs `plots/flint/`).
 
 ## Core APIs
 
