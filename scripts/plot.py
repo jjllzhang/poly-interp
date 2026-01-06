@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 
 import pandas as pd
 import matplotlib
@@ -14,6 +15,10 @@ def _load_csv(csv_path: str) -> Optional[pd.DataFrame]:
     except FileNotFoundError:
         print(f"Error: File '{csv_path}' not found.")
         return None
+
+
+def _slugify(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip())
 
 
 def plot_interp_csv(csv_path: str, logy: bool = True, output_dir: str = "plots") -> None:
@@ -81,6 +86,68 @@ def plot_interp_csv(csv_path: str, logy: bool = True, output_dir: str = "plots")
     _plot("build_tree_ms", "build tree time (ms)")
     _plot("interp_avg_ms", "interpolation time avg (ms)")
     _plot("interp_ms_per_point", "interpolation time per point (ms)")
+
+
+def plot_ops_csv(csv_path: str, logy: bool = True, output_dir: str = "plots") -> None:
+    """
+    Visualize ops_bench CSV (prime,op,n_pow,n,avg_ms,min_ms,max_ms,ms_per_item).
+    Produces two plots per op: avg_ms vs n, ms_per_item vs n.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    df = _load_csv(csv_path)
+    if df is None:
+        return
+
+    # Drop repeated header rows if any
+    if "prime" in df.columns:
+        df = df[df["prime"] != "prime"].copy()
+
+    num_cols = ["n_pow", "n", "avg_ms", "min_ms", "max_ms", "ms_per_item"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=["n", "op"]).copy()
+    if df.empty:
+        print("Error: no valid rows after cleaning CSV.")
+        return
+
+    df = df.sort_values(["op", "prime", "n"])
+
+    def _plot_op(op: str, metric: str, ylabel: str) -> None:
+        if metric not in df.columns:
+            print(f"Skip: column '{metric}' not found in CSV.")
+            return
+
+        sub = df[df["op"] == op]
+        if sub.empty:
+            return
+
+        plt.figure(figsize=(10, 6))
+        for prime, g in sub.groupby("prime"):
+            plt.plot(g["n"], g[metric], marker="o", label=f"prime: {prime}")
+
+        plt.xscale("log", base=2)
+        if logy:
+            plt.yscale("log")
+
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.xlabel("n (number of points)")
+        plt.ylabel(ylabel)
+        plt.title(f"{op} – {metric} vs n")
+        plt.legend()
+        plt.tight_layout()
+
+        filename = f"{_slugify(op)}_{metric}.png"
+        save_path = os.path.join(output_dir, filename)
+        plt.savefig(save_path)
+        print(f"Saved: {save_path}")
+        plt.close()
+
+    for op in df["op"].unique():
+        _plot_op(op, "avg_ms", "time avg (ms)")
+        _plot_op(op, "ms_per_item", "time per item (ms)")
 
 
 def plot_flint_csv(csv_path: str, logy: bool = True, output_dir: str = "plots") -> None:
@@ -164,9 +231,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--format",
-        choices=["auto", "interp", "flint"],
+        choices=["auto", "interp", "flint", "ops"],
         default="auto",
-        help="Input CSV format (auto-detect, or force interp/flint).",
+        help="Input CSV format (auto-detect, or force interp/flint/ops).",
     )
     parser.add_argument(
         "--logy",
@@ -188,7 +255,9 @@ def main() -> None:
         df = _load_csv(args.csv)
         if df is None:
             return
-        if "build_tree_ms" in df.columns or "interp_avg_ms" in df.columns:
+        if "op" in df.columns and "avg_ms" in df.columns:
+            fmt = "ops"
+        elif "build_tree_ms" in df.columns or "interp_avg_ms" in df.columns:
             fmt = "interp"
         elif "avg_us" in df.columns:
             fmt = "flint"
@@ -196,6 +265,8 @@ def main() -> None:
             fmt = "interp"
     if fmt == "interp":
         plot_interp_csv(args.csv, logy=logy, output_dir=args.outdir)
+    elif fmt == "ops":
+        plot_ops_csv(args.csv, logy=logy, output_dir=args.outdir)
     else:
         plot_flint_csv(args.csv, logy=logy, output_dir=args.outdir)
 

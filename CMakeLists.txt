@@ -55,6 +55,15 @@ else()
   target_compile_definitions(interp_bench PRIVATE NDEBUG)
 endif()
 
+add_executable(ops_bench bench/ops_bench.cpp)
+target_link_libraries(ops_bench PRIVATE poly_interp)
+if (NOT MSVC)
+  target_compile_options(ops_bench PRIVATE -O3 -DNDEBUG -march=native)
+else()
+  target_compile_options(ops_bench PRIVATE /O2)
+  target_compile_definitions(ops_bench PRIVATE NDEBUG)
+endif()
+
 # ---- FLINT benchmark (external dependency) ----
 if(PI_ENABLE_FLINT_BENCH)
   find_path(FLINT_INCLUDE_DIR flint/flint.h)
