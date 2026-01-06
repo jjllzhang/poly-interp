@@ -1,8 +1,8 @@
-.PHONY: release debug test bench-interp bench-ops bench-flint plot-interp plot-ops plot-flint clean
+.PHONY: release debug test bench-interp bench-ops bench-ops-flint bench-flint plot-interp plot-ops plot-ops-flint plot-ops-compare plot-flint clean
 
 release:
 	cmake --preset release
-	cmake --build --preset release --target interp_bench ops_bench bench_flint
+	cmake --build --preset release --target interp_bench ops_bench bench_flint ops_bench_flint
 
 debug:
 	cmake --preset debug
@@ -19,9 +19,21 @@ bench-ops: release
 	mkdir -p data
 	./build/release/ops_bench --prime=all --min_pow=8 --max_pow=20 --repeats=3 --csv=1 > data/bench_ops.csv
 
+bench-ops-flint: release
+	mkdir -p data
+	./build/release/ops_bench_flint --prime=all --min_pow=8 --max_pow=20 --repeats=3 --csv=1 > data/bench_ops_flint.csv
+
 plot-ops:
 	mkdir -p plots/ops
 	python3 scripts/plot.py data/bench_ops.csv plots/ops --format=ops --logy
+
+plot-ops-flint:
+	mkdir -p plots/ops_flint
+	python3 scripts/plot.py data/bench_ops_flint.csv plots/ops_flint --format=ops --logy
+
+plot-ops-compare:
+	mkdir -p plots/ops_compare
+	python3 scripts/plot.py data/bench_ops.csv plots/ops_compare --format=ops --compare-ops data/bench_ops_flint.csv --logy
 
 bench-flint: release
 	mkdir -p data

@@ -80,11 +80,18 @@ if(PI_ENABLE_FLINT_BENCH)
   target_include_directories(bench_flint PRIVATE ${FLINT_INCLUDE_DIR})
   target_link_libraries(bench_flint PRIVATE poly_interp ${FLINT_LIBRARY} ${GMP_LIBRARY})
 
+  add_executable(ops_bench_flint bench/ops_bench_flint.cpp)
+  target_include_directories(ops_bench_flint PRIVATE ${FLINT_INCLUDE_DIR})
+  target_link_libraries(ops_bench_flint PRIVATE ${FLINT_LIBRARY} ${GMP_LIBRARY})
+
   if (NOT MSVC)
     target_compile_options(bench_flint PRIVATE -O3 -DNDEBUG -march=native)
+    target_compile_options(ops_bench_flint PRIVATE -O3 -DNDEBUG -march=native)
   else()
     target_compile_options(bench_flint PRIVATE /O2)
     target_compile_definitions(bench_flint PRIVATE NDEBUG)
+    target_compile_options(ops_bench_flint PRIVATE /O2)
+    target_compile_definitions(ops_bench_flint PRIVATE NDEBUG)
   endif()
 endif()
 

@@ -27,11 +27,14 @@ ctest --preset release
 
 - Interp bench (project implementation): `make bench-interp` → writes `data/bench.csv`.
 - Core ops bench (poly mul/div/mod, tree, batch inv, etc.): `make bench-ops` → writes `data/bench_ops.csv`.
+- FLINT ops bench (nmod_poly versions of the same ops): `make bench-ops-flint` → writes `data/bench_ops_flint.csv` (requires FLINT/GMP).
 - FLINT bench (requires FLINT/GMP): `make bench-flint` → writes `data/bench_flint.csv`.
 - Plotting (requires python3 + pandas + matplotlib):
   - `make plot-interp` (reads `data/bench.csv`, outputs `plots/interp/`).
   - `make plot-ops` (reads `data/bench_ops.csv`, outputs `plots/ops/`, uses log-y).
+  - `make plot-ops-flint` (reads `data/bench_ops_flint.csv`, outputs `plots/ops_flint/`, uses log-y).
   - `make plot-flint` (reads `data/bench_flint.csv`, outputs `plots/flint/`).
+  - `python3 scripts/plot.py data/bench_ops_flint.csv plots/ops_flint --format=ops` (FLINT ops plots).
 
 ## Core APIs
 

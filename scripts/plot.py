@@ -21,6 +21,13 @@ def _slugify(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", text.strip())
 
 
+def _basename_label(path: str) -> str:
+    base = os.path.basename(path)
+    if base.endswith(".csv"):
+        base = base[:-4]
+    return base or "ops"
+
+
 def plot_interp_csv(csv_path: str, logy: bool = True, output_dir: str = "plots") -> None:
     """
     Visualize interp_bench CSV and save figures to disk.
@@ -150,6 +157,74 @@ def plot_ops_csv(csv_path: str, logy: bool = True, output_dir: str = "plots") ->
         _plot_op(op, "ms_per_item", "time per item (ms)")
 
 
+def plot_ops_compare(csv_a: str, csv_b: str, logy: bool = True, output_dir: str = "plots",
+                     label_a: str = None, label_b: str = None) -> None:
+    """
+    Plot two ops CSVs on the same chart for comparison (e.g., project vs FLINT).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    df_a = _load_csv(csv_a)
+    df_b = _load_csv(csv_b)
+    if df_a is None or df_b is None:
+        return
+
+    def _clean(df: pd.DataFrame) -> pd.DataFrame:
+        if "prime" in df.columns:
+            df = df[df["prime"] != "prime"].copy()
+        for c in ["n_pow", "n", "avg_ms", "min_ms", "max_ms", "ms_per_item"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna(subset=["n", "op"]).copy()
+
+    df_a = _clean(df_a)
+    df_b = _clean(df_b)
+    if df_a.empty or df_b.empty:
+        print("Error: one of the CSVs has no valid rows after cleaning.")
+        return
+
+    la = label_a or _basename_label(csv_a)
+    lb = label_b or _basename_label(csv_b)
+    df_a["source"] = la
+    df_b["source"] = lb
+
+    df = pd.concat([df_a, df_b], ignore_index=True)
+    df = df.sort_values(["op", "prime", "source", "n"])
+
+    def _plot_op(op: str, metric: str, ylabel: str) -> None:
+        if metric not in df.columns:
+            print(f"Skip: column '{metric}' not found in CSV.")
+            return
+        sub = df[df["op"] == op]
+        if sub.empty:
+            return
+
+        plt.figure(figsize=(10, 6))
+        for (source, prime), g in sub.groupby(["source", "prime"]):
+            plt.plot(g["n"], g[metric], marker="o", label=f"{source}-{prime}")
+
+        plt.xscale("log", base=2)
+        if logy:
+            plt.yscale("log")
+
+        plt.grid(True, which="both", linestyle="--", linewidth=0.5)
+        plt.xlabel("n (number of points)")
+        plt.ylabel(ylabel)
+        plt.title(f"{op} – {metric} vs n (compare)")
+        plt.legend()
+        plt.tight_layout()
+
+        filename = f"compare_{_slugify(op)}_{metric}.png"
+        save_path = os.path.join(output_dir, filename)
+        plt.savefig(save_path)
+        print(f"Saved: {save_path}")
+        plt.close()
+
+    for op in df["op"].unique():
+        _plot_op(op, "avg_ms", "time avg (ms)")
+        _plot_op(op, "ms_per_item", "time per item (ms)")
+
+
 def plot_flint_csv(csv_path: str, logy: bool = True, output_dir: str = "plots") -> None:
     """
     Visualize FLINT bench CSV (lib,mod,k,n,avg_us).
@@ -236,6 +311,16 @@ def main() -> None:
         help="Input CSV format (auto-detect, or force interp/flint/ops).",
     )
     parser.add_argument(
+        "--compare-ops",
+        default=None,
+        help="Second ops CSV for comparison (only used with --format=ops or auto-detected ops).",
+    )
+    parser.add_argument(
+        "--compare-label",
+        default=None,
+        help="Label for the comparison CSV (optional; default uses basename).",
+    )
+    parser.add_argument(
         "--logy",
         action="store_true",
         help="Use log scale on Y axis (default: off unless --logy)",
@@ -266,7 +351,13 @@ def main() -> None:
     if fmt == "interp":
         plot_interp_csv(args.csv, logy=logy, output_dir=args.outdir)
     elif fmt == "ops":
-        plot_ops_csv(args.csv, logy=logy, output_dir=args.outdir)
+        if args.compare_ops:
+            plot_ops_compare(args.csv, args.compare_ops, logy=logy,
+                             output_dir=args.outdir,
+                             label_a=_basename_label(args.csv),
+                             label_b=args.compare_label or _basename_label(args.compare_ops))
+        else:
+            plot_ops_csv(args.csv, logy=logy, output_dir=args.outdir)
     else:
         plot_flint_csv(args.csv, logy=logy, output_dir=args.outdir)
 
