@@ -423,6 +423,299 @@ inline std::vector<u32> convolution_mod_ntt(const std::vector<u32>& a,
 }
 
 
+// =========================================================================================
+// [NTT-64] 3×64-bit primes (each has 2^21 factor) for large p (e.g., M61) to reduce CRT cost
+// =========================================================================================
+struct NTT64Prime {
+    u64 mod;
+    u64 primitive_root;
+    int max_base; // supports length up to 2^max_base
+};
+
+// product ~ 2^180 >> bound for p<=2^61, n<=2^20
+static constexpr std::array<NTT64Prime, 3> kNTT64 = {{
+    {508655436684066817ULL, 5ULL, 21},       // 5 * 2^21 * 80848604311 + 1
+    {1072774856935735297ULL, 10ULL, 21},     // 10 * 2^21 * 3479856559 + 1
+    {841916508553609217ULL, 3ULL, 21},       // 3 * 2^21 * 8006563 * 7 * 13 * 19 * 29 + 1
+}};
+
+inline u64 add_mod64(u64 a, u64 b, u64 mod) {
+    u64 s = a + b;
+    if (s >= mod) s -= mod;
+    return s;
+}
+inline u64 sub_mod64(u64 a, u64 b, u64 mod) {
+    return (a >= b) ? (a - b) : (a + mod - b);
+}
+inline u64 mul_mod64(u64 a, u64 b, u64 mod) {
+    return (u64)((u128)a * (u128)b % (u128)mod);
+}
+inline u64 pow_mod64(u64 a, u64 e, u64 mod) {
+    u64 r = 1, x = a;
+    while (e) {
+        if (e & 1) r = mul_mod64(r, x, mod);
+        x = mul_mod64(x, x, mod);
+        e >>= 1;
+    }
+    return r;
+}
+inline u64 inv_mod64(u64 a, u64 mod) {
+    return pow_mod64(a, mod - 2, mod);
+}
+
+struct NTT64Cache {
+    u64 mod = 0;
+    u64 primitive_root = 0;
+    int max_base = 0;
+    u32 cache_n = 0; // root/iroot length
+    int inv_ready_upto = -1;
+    std::array<u64, 32> inv_n_by_log{};
+    std::vector<u64> root;
+    std::vector<u64> iroot;
+};
+
+inline void build_root_table64(NTT64Cache& C, u32 n) {
+    if (n == C.cache_n) return;
+
+    const int logn = __builtin_ctz((unsigned)n);
+    if (logn > C.max_base) {
+        throw std::runtime_error("NTT64 cache: n exceeds max_base");
+    }
+
+    // compute base = primitive_root^{(mod-1)/n} (primitive n-th root)
+    const u64 base  = pow_mod64(C.primitive_root, (C.mod - 1) / n, C.mod);
+    const u64 ibase = inv_mod64(base, C.mod);
+
+    C.cache_n = n;
+    C.root.resize(n);
+    C.iroot.resize(n);
+    C.root[0]  = 1;
+    for (u32 i = 1; i < n; ++i) {
+        C.root[i] = mul_mod64(C.root[i - 1], base, C.mod);
+    }
+
+    C.iroot[0] = 1;
+    for (u32 i = 1; i < n; ++i) {
+        C.iroot[i] = mul_mod64(C.iroot[i - 1], ibase, C.mod);
+    }
+
+    for (int k = 0; k <= logn; ++k) {
+        const u32 n_k = (u32)1u << k;
+        C.inv_n_by_log[k] = inv_mod64(n_k, C.mod);
+    }
+    C.inv_ready_upto = logn;
+}
+
+inline NTT64Cache& ensure_ntt64_cache(std::size_t prime_idx, u32 n) {
+    static thread_local std::array<NTT64Cache, kNTT64.size()> caches;
+
+    NTT64Cache& C = caches[prime_idx];
+    const auto prm = kNTT64[prime_idx];
+
+    if (C.mod == 0) {
+        C.mod = prm.mod;
+        C.primitive_root = prm.primitive_root;
+        C.max_base = prm.max_base;
+        C.cache_n = 0;
+        C.inv_ready_upto = -1;
+    }
+
+    if (C.mod != prm.mod) {
+        throw std::runtime_error("NTT64 cache: modulus mismatch");
+    }
+
+    if (n == 0 || (n & (n - 1)) != 0) {
+        throw std::runtime_error("NTT64 cache: n must be power-of-two");
+    }
+
+    if (C.cache_n < n) {
+        build_root_table64(C, n);
+        return C;
+    }
+
+    int logn = __builtin_ctz((unsigned)n);
+    if (C.inv_ready_upto < logn) {
+        for (int k = C.inv_ready_upto + 1; k <= logn; ++k) {
+            const u32 n_k = (u32)1u << k;
+            C.inv_n_by_log[k] = inv_mod64(n_k, C.mod);
+        }
+        C.inv_ready_upto = logn;
+    }
+
+    return C;
+}
+
+inline void ntt64_cached(std::size_t prime_idx, std::vector<u64>& a, bool invert) {
+    const u32 n = (u32)a.size();
+    NTT64Cache& C = ensure_ntt64_cache(prime_idx, n);
+    const u64 mod = C.mod;
+    const u64 mod2 = mod + mod;
+    const u32 cache_n = C.cache_n;
+
+#ifndef NDEBUG
+    for (u32 i = 0; i < n; ++i) {
+        if (a[i] >= mod) a[i] %= mod;
+    }
+#endif
+
+    const auto& rev = bitrev_table(n);
+    for (u32 i = 0; i < n; ++i) {
+        const u32 j = rev[i];
+        if (i < j) std::swap(a[i], a[j]);
+    }
+
+    u64* A = a.data();
+    const u64* RT = invert ? C.iroot.data() : C.root.data();
+
+    for (u32 len = 2; len <= n; len <<= 1) {
+        const u32 half = len >> 1;
+        const u32 step = cache_n / len;
+
+        for (u32 blk = 0; blk < n; blk += len) {
+            u64* p = A + blk;
+            u64* q = p + half;
+
+            u32 idx = 0;
+            for (u32 j = 0; j < half; ++j) {
+                u64 x = p[j];
+                u64 y = mul_mod64(q[j], RT[idx], mod);
+
+                u64 u = x + y;
+                if (u >= mod2) u -= mod2;
+
+                u64 v = x + mod - y;
+                if (v >= mod2) v -= mod2;
+
+                p[j] = u;
+                q[j] = v;
+                idx += step;
+            }
+        }
+    }
+
+    if (invert) {
+        const int logn = __builtin_ctz((unsigned)n);
+        const u64 inv_n = C.inv_n_by_log[logn];
+
+        for (u32 i = 0; i < n; ++i) {
+            u64 x = a[i];
+            if (x >= mod) x -= mod;
+            a[i] = mul_mod64(x, inv_n, mod);
+        }
+    }
+}
+
+struct NTT64ConvScratch {
+    std::vector<u64> fb;
+};
+inline NTT64ConvScratch& conv64_scratch(std::size_t prime_idx) {
+    static thread_local std::array<NTT64ConvScratch, kNTT64.size()> S;
+    return S[prime_idx];
+}
+
+inline void convolution_mod_ntt64_into(std::vector<u64>& out,
+                                       const std::vector<u64>& a,
+                                       const std::vector<u64>& b,
+                                       std::size_t prime_idx) {
+    if (a.empty() || b.empty()) {
+        out.clear();
+        return;
+    }
+
+    const auto prm = kNTT64[prime_idx];
+
+    std::size_t need = a.size() + b.size() - 1;
+    std::size_t ntt_n = 1;
+    while (ntt_n < need) ntt_n <<= 1;
+
+    if ((int)__builtin_ctzll((unsigned long long)ntt_n) > prm.max_base) {
+        throw std::runtime_error("convolution_mod_ntt64_into: NTT length exceeds prime capability");
+    }
+
+    NTT64Cache& C = ensure_ntt64_cache(prime_idx, (u32)ntt_n);
+    const u64 mod = C.mod;
+
+    out.resize(ntt_n);
+    std::copy(a.begin(), a.end(), out.begin());
+    if (a.size() < ntt_n) std::fill(out.begin() + a.size(), out.end(), 0u);
+
+    auto& S = conv64_scratch(prime_idx);
+    S.fb.resize(ntt_n);
+    std::copy(b.begin(), b.end(), S.fb.begin());
+    if (b.size() < ntt_n) std::fill(S.fb.begin() + b.size(), S.fb.end(), 0u);
+
+    ntt64_cached(prime_idx, out, false);
+    ntt64_cached(prime_idx, S.fb, false);
+
+    for (std::size_t i = 0; i < ntt_n; ++i) {
+        out[i] = mul_mod64(out[i], S.fb[i], mod);
+    }
+
+    ntt64_cached(prime_idx, out, true);
+    out.resize(need);
+}
+
+// CRT for 3×64-bit primes -> modulo target p (u64)
+struct CRT3Plan64 {
+    u64 p = 0;
+    std::array<u64, 3> m{};
+    u64 inv_m0_mod_m1 = 0;
+    u64 inv_m01_mod_m2 = 0;
+    u128 M01 = 0;
+    u64 m0_mod_p = 0;
+    u64 m0m1_mod_p = 0;
+
+    CRT3Plan64() = default;
+    explicit CRT3Plan64(u64 mod_p) : p(mod_p) {
+        for (int i = 0; i < 3; ++i) m[i] = kNTT64[i].mod;
+        inv_m0_mod_m1 = inv_mod64(m[0] % m[1], m[1]);
+        M01 = (u128)m[0] * (u128)m[1];
+        inv_m01_mod_m2 = inv_mod64((u64)(M01 % m[2]), m[2]);
+
+        m0_mod_p = (u64)((u128)m[0] % (u128)p);
+        m0m1_mod_p = (u64)((u128)M01 % (u128)p);
+    }
+
+    inline u64 combine_to_mod_p(const u64* r3) const {
+        // Garner style: x = r0 + m0*t1 + m0*m1*t2
+        u64 t1 = r3[1] >= r3[0] ? (r3[1] - r3[0]) : (r3[1] + m[1] - (r3[0] % m[1]));
+        t1 = (u64)((u128)t1 * (u128)inv_m0_mod_m1 % (u128)m[1]);
+
+        u64 r01 = r3[0] + (u64)((u128)m[0] * (u128)t1 % (u128)m[2]);
+        r01 %= m[2];
+
+        u64 t2 = r3[2] >= r01 ? (r3[2] - r01) : (r3[2] + m[2] - r01);
+        t2 = (u64)((u128)t2 * (u128)inv_m01_mod_m2 % (u128)m[2]);
+
+        const u64 term0 = r3[0] % p;
+        const u64 term1 = (u64)((u128)m0_mod_p * (u128)t1 % (u128)p);
+        const u64 term2 = (u64)((u128)m0m1_mod_p % (u128)p * (u128)t2 % (u128)p);
+
+        u64 res = term0 + term1;
+        if (res >= p) res -= p;
+        res += term2;
+        if (res >= p) res -= p;
+        return res;
+    }
+};
+
+inline std::size_t select_prime_count64(u64 p, std::size_t min_dim) {
+    (void)p;
+    if (min_dim == 0) return 3;
+    const double log_bound = std::log2(static_cast<double>(min_dim)) +
+                             2.0 * std::log2(static_cast<double>(p));
+    double log_prod3 = 0.0;
+    for (int i = 0; i < 3; ++i) log_prod3 += std::log2(static_cast<double>(kNTT64[i].mod));
+    if (log_bound + 2.0 <= log_prod3) return 3;
+    throw std::runtime_error("select_prime_count64: coefficient bound exceeds 3 wide primes");
+}
+
+inline bool use_ntt64_backend(u64 p) {
+    // Prefer wide primes when target modulus is large (e.g., 61-bit Mersenne).
+    return p > (1ULL << 40);
+}
+
+
 // Garner precomputation for CRT to target modulus p (u64)
 // We will compute x mod p, assuming product(mods) > true integer convolution bound.
 struct GarnerPrecomp {
@@ -817,48 +1110,46 @@ public:
         }
 
         const u64 p = F.modulus();
-        const std::size_t prime_count = detail::select_prime_count(p, min_dim);
+        // 决策：仅当 p 大且规模超过 cutover 时才使用 64 位 NTT
+        static constexpr std::size_t kWideCutover = 4096; // need >= 4096 才切到 64 位 NTT
+        const bool wide_ntt = (p > (1ULL << 40)) && (need >= kWideCutover);
+        const std::size_t prime_count = wide_ntt
+                                      ? detail::select_prime_count64(p, min_dim)
+                                      : detail::select_prime_count(p, min_dim);
 
 #ifndef NDEBUG
         // Debug guard: ensure CRT product covers coefficient bound
         const double log2_bound = std::log2(static_cast<double>(min_dim)) +
                                   2.0 * std::log2(static_cast<double>(p));
         double log2_M = 0.0;
-        for (std::size_t i = 0; i < prime_count; ++i) {
-            log2_M += std::log2(static_cast<double>(detail::kNTT[i].mod));
+        if (wide_ntt) {
+            for (std::size_t i = 0; i < prime_count; ++i) {
+                log2_M += std::log2(static_cast<double>(detail::kNTT64[i].mod));
+            }
+        } else {
+            for (std::size_t i = 0; i < prime_count; ++i) {
+                log2_M += std::log2(static_cast<double>(detail::kNTT[i].mod));
+            }
         }
         assert(log2_M > log2_bound + 2.0);
 #endif
 
-        // residues[k] will be reused as fa buffer/output for each prime
-        std::vector<std::vector<detail::u32>> residues(prime_count);
-
-        for (std::size_t k = 0; k < prime_count; ++k) {
-            const auto prm = detail::kNTT[k];
-
-            std::vector<detail::u32> a32(n), b32(m);
-            // [BARRETT INPUT REDUCE] avoid % in input conversion
-            auto& CC = detail::ensure_ntt_cache(k, 1u); // only to access barrett_im (no rebuild)
-            const detail::u32 mod = prm.mod;
-            const detail::u64 im  = CC.barrett_im;
-
-            for (std::size_t i = 0; i < n; ++i) {
-                a32[i] = detail::barrett_reduce_u64((detail::u64)c_[i].v, mod, im);
-            }
-            for (std::size_t j = 0; j < m; ++j) {
-                b32[j] = detail::barrett_reduce_u64((detail::u64)g.c_[j].v, mod, im);
-            }
-
-            // [BUFFER REUSE] in-place convolution: residues[k] is fa (work + output),
-            // fb is thread_local scratch inside convolution_mod_ntt_into
-            detail::convolution_mod_ntt_into(residues[k], a32, b32, k);
-            // residues[k].size() == need
-        }
-
         std::vector<Fp> out(need, F.zero());
-        if (prime_count <= 3) {
-            pf::detail::CRT3Plan crt_plan(p);
-            std::array<detail::u32, 3> r{};
+        if (wide_ntt) {
+            std::vector<std::vector<detail::u64>> residues(prime_count);
+
+            for (std::size_t k = 0; k < prime_count; ++k) {
+                std::vector<detail::u64> a64(n), b64(m);
+                const detail::u64 mod = detail::kNTT64[k].mod;
+
+                for (std::size_t i = 0; i < n; ++i) a64[i] = c_[i].v % mod;
+                for (std::size_t j = 0; j < m; ++j) b64[j] = g.c_[j].v % mod;
+
+                detail::convolution_mod_ntt64_into(residues[k], a64, b64, k);
+            }
+
+            pf::detail::CRT3Plan64 crt_plan(p);
+            std::array<detail::u64, 3> r{};
 
             for (std::size_t idx = 0; idx < need; ++idx) {
                 for (std::size_t k = 0; k < 3; ++k) {
@@ -868,15 +1159,53 @@ public:
                 out[idx] = Fp{val};
             }
         } else {
-            pf::detail::CRT5Plan crt_plan(p);
-            std::array<detail::u32, 5> r{};
+            // residues[k] will be reused as fa buffer/output for each prime
+            std::vector<std::vector<detail::u32>> residues(prime_count);
 
-            for (std::size_t idx = 0; idx < need; ++idx) {
-                for (std::size_t k = 0; k < prime_count; ++k) {
-                    r[k] = residues[k][idx];
+            for (std::size_t k = 0; k < prime_count; ++k) {
+                const auto prm = detail::kNTT[k];
+
+                std::vector<detail::u32> a32(n), b32(m);
+                // [BARRETT INPUT REDUCE] avoid % in input conversion
+                auto& CC = detail::ensure_ntt_cache(k, 1u); // only to access barrett_im (no rebuild)
+                const detail::u32 mod = prm.mod;
+                const detail::u64 im  = CC.barrett_im;
+
+                for (std::size_t i = 0; i < n; ++i) {
+                    a32[i] = detail::barrett_reduce_u64((detail::u64)c_[i].v, mod, im);
                 }
-                u64 val = crt_plan.combine_to_mod_p(r.data());
-                out[idx] = Fp{val};
+                for (std::size_t j = 0; j < m; ++j) {
+                    b32[j] = detail::barrett_reduce_u64((detail::u64)g.c_[j].v, mod, im);
+                }
+
+                // [BUFFER REUSE] in-place convolution: residues[k] is fa (work + output),
+                // fb is thread_local scratch inside convolution_mod_ntt_into
+                detail::convolution_mod_ntt_into(residues[k], a32, b32, k);
+                // residues[k].size() == need
+            }
+
+            if (prime_count <= 3) {
+                pf::detail::CRT3Plan crt_plan(p);
+                std::array<detail::u32, 3> r{};
+
+                for (std::size_t idx = 0; idx < need; ++idx) {
+                    for (std::size_t k = 0; k < 3; ++k) {
+                        r[k] = residues[k][idx];
+                    }
+                    u64 val = crt_plan.combine_to_mod_p(r.data());
+                    out[idx] = Fp{val};
+                }
+            } else {
+                pf::detail::CRT5Plan crt_plan(p);
+                std::array<detail::u32, 5> r{};
+
+                for (std::size_t idx = 0; idx < need; ++idx) {
+                    for (std::size_t k = 0; k < prime_count; ++k) {
+                        r[k] = residues[k][idx];
+                    }
+                    u64 val = crt_plan.combine_to_mod_p(r.data());
+                    out[idx] = Fp{val};
+                }
             }
         }
 
@@ -1148,35 +1477,29 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
 
     // 大规模：NTT/CRT，但只对低位需要的部分做输入截断，并且只合并 out_need 个系数
     const u64 p = F.modulus();
-    const std::size_t prime_count = pf::detail::select_prime_count(p, min_dim);
-
-    std::vector<std::vector<pf::detail::u32>> residues;
-    residues.resize(prime_count);
-
-    for (std::size_t idxp = 0; idxp < prime_count; ++idxp) {
-        const auto prm = pf::detail::kNTT[idxp];
-
-        std::vector<pf::detail::u32> A32(an), B32(bn);
-        // [BARRETT INPUT REDUCE] avoid % in input conversion
-        auto& CC = pf::detail::ensure_ntt_cache(idxp, 1u);
-        const pf::detail::u32 mod = prm.mod;
-        const pf::detail::u64 im  = CC.barrett_im;
-
-        for (size_type i = 0; i < an; ++i) {
-            A32[i] = pf::detail::barrett_reduce_u64((pf::detail::u64)a.c_[i].v, mod, im);
-        }
-        for (size_type j = 0; j < bn; ++j) {
-            B32[j] = pf::detail::barrett_reduce_u64((pf::detail::u64)b.c_[j].v, mod, im);
-        }
-
-        pf::detail::convolution_mod_ntt_into(residues[idxp], A32, B32, idxp);
-        if (residues[idxp].size() > out_need) residues[idxp].resize(out_need);
-    }
+    // 决策：仅当 p 大且规模超过 cutover 时才使用 64 位 NTT
+    static constexpr std::size_t kWideCutover = 4096; // out_need >= 4096 才切到 64 位 NTT
+    const bool wide_ntt = (p > (1ULL << 40)) && (out_need >= kWideCutover);
+    const std::size_t prime_count = wide_ntt
+                                      ? pf::detail::select_prime_count64(p, min_dim)
+                                      : pf::detail::select_prime_count(p, min_dim);
 
     std::vector<Fp> out(out_need, F.zero());
-    if (prime_count <= 3) {
-        pf::detail::CRT3Plan crt_plan(p);
-        std::array<pf::detail::u32, 3> r{};
+    if (wide_ntt) {
+        std::vector<std::vector<pf::detail::u64>> residues(prime_count);
+        for (std::size_t idxp = 0; idxp < prime_count; ++idxp) {
+            const pf::detail::u64 mod = pf::detail::kNTT64[idxp].mod;
+
+            std::vector<pf::detail::u64> A64(an), B64(bn);
+            for (size_type i = 0; i < an; ++i) A64[i] = a.c_[i].v % mod;
+            for (size_type j = 0; j < bn; ++j) B64[j] = b.c_[j].v % mod;
+
+            pf::detail::convolution_mod_ntt64_into(residues[idxp], A64, B64, idxp);
+            if (residues[idxp].size() > out_need) residues[idxp].resize(out_need);
+        }
+
+        pf::detail::CRT3Plan64 crt_plan(p);
+        std::array<pf::detail::u64, 3> r{};
 
         for (size_type i = 0; i < out_need; ++i) {
             for (std::size_t idxp = 0; idxp < 3; ++idxp) {
@@ -1186,15 +1509,51 @@ inline pf::FpPoly pf::FpPoly::mul_trunc_poly(const FpPoly& a, const FpPoly& b, s
             out[i] = Fp{val};
         }
     } else {
-        pf::detail::CRT5Plan crt_plan(p);
-        std::array<pf::detail::u32, 5> r{};
+        std::vector<std::vector<pf::detail::u32>> residues;
+        residues.resize(prime_count);
 
-        for (size_type i = 0; i < out_need; ++i) {
-            for (std::size_t idxp = 0; idxp < prime_count; ++idxp) {
-                r[idxp] = residues[idxp][i];
+        for (std::size_t idxp = 0; idxp < prime_count; ++idxp) {
+            const auto prm = pf::detail::kNTT[idxp];
+
+            std::vector<pf::detail::u32> A32(an), B32(bn);
+            // [BARRETT INPUT REDUCE] avoid % in input conversion
+            auto& CC = pf::detail::ensure_ntt_cache(idxp, 1u);
+            const pf::detail::u32 mod = prm.mod;
+            const pf::detail::u64 im  = CC.barrett_im;
+
+            for (size_type i = 0; i < an; ++i) {
+                A32[i] = pf::detail::barrett_reduce_u64((pf::detail::u64)a.c_[i].v, mod, im);
             }
-            const u64 val = crt_plan.combine_to_mod_p(r.data());
-            out[i] = Fp{val};
+            for (size_type j = 0; j < bn; ++j) {
+                B32[j] = pf::detail::barrett_reduce_u64((pf::detail::u64)b.c_[j].v, mod, im);
+            }
+
+            pf::detail::convolution_mod_ntt_into(residues[idxp], A32, B32, idxp);
+            if (residues[idxp].size() > out_need) residues[idxp].resize(out_need);
+        }
+
+        if (prime_count <= 3) {
+            pf::detail::CRT3Plan crt_plan(p);
+            std::array<pf::detail::u32, 3> r{};
+
+            for (size_type i = 0; i < out_need; ++i) {
+                for (std::size_t idxp = 0; idxp < 3; ++idxp) {
+                    r[idxp] = residues[idxp][i];
+                }
+                const u64 val = crt_plan.combine_to_mod_p(r.data());
+                out[i] = Fp{val};
+            }
+        } else {
+            pf::detail::CRT5Plan crt_plan(p);
+            std::array<pf::detail::u32, 5> r{};
+
+            for (size_type i = 0; i < out_need; ++i) {
+                for (std::size_t idxp = 0; idxp < prime_count; ++idxp) {
+                    r[idxp] = residues[idxp][i];
+                }
+                const u64 val = crt_plan.combine_to_mod_p(r.data());
+                out[i] = Fp{val};
+            }
         }
     }
 
