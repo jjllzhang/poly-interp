@@ -1705,6 +1705,12 @@ struct FpPoly::SubproductTree {
     std::vector<Fp> points;
     std::vector<std::vector<FpPoly>> levels;
 
+    // Cached derivative evaluations
+    mutable bool dg_ready = false;
+    mutable bool inv_dg_ready = false;
+    mutable std::vector<Fp> dg_vals;
+    mutable std::vector<Fp> inv_dg_vals;
+
     SubproductTree() = default;
     explicit SubproductTree(const FpCtx& c) : ctx(&c) {}
 
@@ -1717,6 +1723,51 @@ struct FpPoly::SubproductTree {
             throw std::logic_error("SubproductTree::root: empty tree");
         }
         return levels.back()[0];
+    }
+
+    // Ensure dG(x_i) (and optionally its inverse) is computed and cached.
+    void ensure_derivative_vals(bool need_inv) const {
+        if (!ctx) {
+            throw std::invalid_argument("SubproductTree::ensure_derivative_vals: ctx is null");
+        }
+        const std::size_t n = n_points();
+        if (!dg_ready) {
+            if (n == 0) {
+                dg_vals.clear();
+            } else {
+                // G' evaluated on all points
+                FpPoly dG = root().derivative();
+                dg_vals = dG.multipoint_eval(*this);
+                if (dg_vals.size() != n) {
+                    throw std::logic_error("SubproductTree::ensure_derivative_vals: unexpected dG size");
+                }
+                for (std::size_t i = 0; i < n; ++i) {
+                    if (dg_vals[i].v == 0) {
+                        throw std::domain_error("SubproductTree::ensure_derivative_vals: dG(x_i)=0 (points likely not distinct)");
+                    }
+                }
+            }
+            dg_ready = true;
+            inv_dg_ready = false; // derivative updated; invalidate inverse cache
+        }
+
+        if (need_inv && !inv_dg_ready) {
+            inv_dg_vals = dg_vals;
+            if (!inv_dg_vals.empty()) {
+                ctx->batch_inv(inv_dg_vals);
+            }
+            inv_dg_ready = true;
+        }
+    }
+
+    const std::vector<Fp>& derivative_vals() const {
+        ensure_derivative_vals(false);
+        return dg_vals;
+    }
+
+    const std::vector<Fp>& inv_derivative_vals() const {
+        ensure_derivative_vals(true);
+        return inv_dg_vals;
     }
 
     // 构建子乘积树（正确优先，乘法用朴素 mul）
@@ -1918,33 +1969,15 @@ inline FpPoly FpPoly::interpolate_subproduct_tree(const SubproductTree& tree,
         throw std::invalid_argument("interpolate_subproduct_tree: malformed tree (levels[0] size mismatch)");
     }
 
-    // 1) G(x) = Π (x - x_i)
-    const FpPoly& G = tree.root();
+    // cached inv(dG(x_i))
+    const auto& inv_dvals = tree.inv_derivative_vals();
 
-    // 2) dG = G'(x)
-    FpPoly dG = G.derivative();
-
-    // 3) 计算 dG(x_i)
-    std::vector<Fp> dvals = dG.multipoint_eval(tree);
-    if (dvals.size() != n) {
-        throw std::logic_error("interpolate_subproduct_tree: unexpected dvals size");
-    }
-
-    // 4) 一次性求逆：dvals[i] <- inv(dG(x_i))
-    for (std::size_t i = 0; i < n; ++i) {
-        if (dvals[i].v == 0) {
-            // 通常意味着 x_i 不互异导致 dG(x_i)=0
-            throw std::domain_error("interpolate_subproduct_tree: dG(x_i)=0 (points likely not distinct)");
-        }
-    }
-    F.batch_inv(dvals);
-
-    // 5) a_i = y_i * inv(dG(x_i))
+    // a_i = y_i * inv(dG(x_i))
     std::vector<Fp> a(n, F.zero());
     for (std::size_t i = 0; i < n; ++i) {
         Fp yi = ys[i];
         yi.v %= F.modulus();
-        a[i] = F.mul(yi, dvals[i]);
+        a[i] = F.mul(yi, inv_dvals[i]);
     }
 
 

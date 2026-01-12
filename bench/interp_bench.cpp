@@ -153,7 +153,17 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
     // 输出表头
     if (opt.csv) {
         std::cout
-            << "prime,label,n_pow,n,build_tree_ms,interp_avg_ms,interp_min_ms,interp_max_ms,interp_ms_per_point,fingerprint\n";
+            << "prime,label,n_pow,n,"
+            << "build_tree_ms,"
+            << "interp_pre_ms,"                 // precompute inv(dG(x_i)) once
+            << "interp_core_avg_ms,"            // pure interpolation (reuse precompute)
+            << "interp_core_min_ms,"
+            << "interp_core_max_ms,"
+            << "interp_avg_ms,"                 // total = pre + core
+            << "interp_min_ms,"
+            << "interp_max_ms,"
+            << "interp_ms_per_point,"
+            << "fingerprint\n";
     } else {
         std::cout << "Prime " << prime_label << " (p=" << p << ")\n";
         std::cout << "n=2^k, k in [" << opt.min_pow << "," << opt.max_pow << "], repeats=" << opt.repeats << "\n";
@@ -185,9 +195,11 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
         }
 
         // 2) interpolation timing (tree reused)
-        double sum_interp_ms = 0.0;
-        double min_interp_ms = 1e300;
-        double max_interp_ms = 0.0;
+        double precompute_ms = 0.0;  // measured once per n
+        bool precomputed = false;
+        double core_sum_ms = 0.0;
+        double core_min_ms = 1e300;
+        double core_max_ms = 0.0;
         u64 fp_acc = 0;
 
         for (int rep = 0; rep < opt.repeats; ++rep) {
@@ -199,15 +211,24 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
 
             FpPoly poly(F);
 
-            auto t2 = std::chrono::steady_clock::now();
+            double pre_ms_this = 0.0;
+            if (!precomputed) {
+                auto tpre0 = std::chrono::steady_clock::now();
+                tree.inv_derivative_vals();
+                auto tpre1 = std::chrono::steady_clock::now();
+                pre_ms_this = std::chrono::duration<double, std::milli>(tpre1 - tpre0).count();
+                precompute_ms = pre_ms_this;
+                precomputed = true;
+            }
+            auto tcore0 = std::chrono::steady_clock::now();
             poly = FpPoly::interpolate_subproduct_tree(tree, ys);
-            auto t3 = std::chrono::steady_clock::now();
+            auto tcore1 = std::chrono::steady_clock::now();
 
-            const double interp_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+            const double core_ms = std::chrono::duration<double, std::milli>(tcore1 - tcore0).count();
 
-            sum_interp_ms += interp_ms;
-            min_interp_ms = std::min(min_interp_ms, interp_ms);
-            max_interp_ms = std::max(max_interp_ms, interp_ms);
+            core_sum_ms += core_ms;
+            core_min_ms = std::min(core_min_ms, core_ms);
+            core_max_ms = std::max(core_max_ms, core_ms);
 
             // 抽样验证（不计入 interp_ms）
             if (opt.verify_samples > 0) {
@@ -230,8 +251,11 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
             global_sink ^= fp_acc;
         }
 
-        const double avg_interp_ms = sum_interp_ms / (double)opt.repeats;
-        const double ms_per_point = avg_interp_ms / (double)n;
+        const double core_avg_ms = core_sum_ms / (double)opt.repeats;
+        const double total_avg_ms = precompute_ms + core_avg_ms; // 预计算一次 + 一次核心插值的平均时间
+        const double total_min_ms = precompute_ms + core_min_ms;
+        const double total_max_ms = precompute_ms + core_max_ms;
+        const double ms_per_point = total_avg_ms / (double)n;
 
         if (opt.csv) {
             std::cout
@@ -239,9 +263,13 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
                 << k << "," << n << ","
                 << std::fixed << std::setprecision(3)
                 << build_ms << ","
-                << avg_interp_ms << ","
-                << min_interp_ms << ","
-                << max_interp_ms << ","
+                << precompute_ms << ","
+                << core_avg_ms << ","
+                << core_min_ms << ","
+                << core_max_ms << ","
+                << total_avg_ms << ","
+                << total_min_ms << ","
+                << total_max_ms << ","
                 << std::setprecision(9) << ms_per_point << ","
                 << std::hex << fp_acc << std::dec
                 << "\n";
@@ -249,8 +277,11 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
             std::cout
                 << "n=2^" << k << " (" << n << "): "
                 << "build=" << std::fixed << std::setprecision(3) << build_ms << " ms, "
-                << "interp(avg)=" << avg_interp_ms << " ms "
-                << "(min=" << min_interp_ms << ", max=" << max_interp_ms << "), "
+                << "interp_pre=" << precompute_ms << " ms, "
+                << "interp_core(avg)=" << core_avg_ms << " ms "
+                << "(min=" << core_min_ms << ", max=" << core_max_ms << "), "
+                << "interp_total(avg)=" << total_avg_ms << " ms "
+                << "(min=" << total_min_ms << ", max=" << total_max_ms << "), "
                 << "ms/pt=" << std::setprecision(9) << ms_per_point
                 << ", fp=0x" << std::hex << fp_acc << std::dec
                 << "\n";

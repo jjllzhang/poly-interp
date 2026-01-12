@@ -45,6 +45,10 @@ def plot_interp_csv(csv_path: str, logy: bool = True, output_dir: str = "plots")
     num_cols = [
         "n_pow", "n",
         "build_tree_ms",
+        "interp_pre_ms",
+        "interp_core_avg_ms",
+        "interp_core_min_ms",
+        "interp_core_max_ms",
         "interp_avg_ms",
         "interp_min_ms",
         "interp_max_ms",
@@ -91,7 +95,9 @@ def plot_interp_csv(csv_path: str, logy: bool = True, output_dir: str = "plots")
         plt.close()
 
     _plot("build_tree_ms", "build tree time (ms)")
-    _plot("interp_avg_ms", "interpolation time avg (ms)")
+    _plot("interp_pre_ms", "interp precompute time (ms)")
+    _plot("interp_core_avg_ms", "interp core time avg (ms)")
+    _plot("interp_avg_ms", "interpolation total time avg (ms)")
     _plot("interp_ms_per_point", "interpolation time per point (ms)")
 
 
@@ -113,6 +119,10 @@ def plot_interp_compare(csv_a: str, csv_b: str, logy: bool = True, output_dir: s
         num_cols = [
             "n_pow", "n",
             "build_tree_ms",
+            "interp_pre_ms",
+            "interp_core_avg_ms",
+            "interp_core_min_ms",
+            "interp_core_max_ms",
             "interp_avg_ms",
             "interp_min_ms",
             "interp_max_ms",
@@ -168,7 +178,9 @@ def plot_interp_compare(csv_a: str, csv_b: str, logy: bool = True, output_dir: s
         plt.close()
 
     _plot("build_tree_ms", "build tree time (ms)")
-    _plot("interp_avg_ms", "interpolation time avg (ms)")
+    _plot("interp_pre_ms", "interp precompute time (ms)")
+    _plot("interp_core_avg_ms", "interp core time avg (ms)")
+    _plot("interp_avg_ms", "interpolation total time avg (ms)")
     _plot("interp_ms_per_point", "interpolation time per point (ms)")
 
 

@@ -456,7 +456,8 @@ static void run_one_prime(ulong p, const std::string& prime_label, const Options
         Timings binv = bench_batch_inv(xs, p, opt.repeats, rng_state);
 
         if (opt.csv) {
-            print_row_csv(prime_label, "product_roots", k, n, prod);
+            // Align op naming with project benchmarks for plotting/compare.
+            print_row_csv(prime_label, "subproduct_build", k, n, prod);
             print_row_csv(prime_label, "poly_mul", k, n, mul);
             print_row_csv(prime_label, "poly_divrem", k, n, div);
             print_row_csv(prime_label, "poly_mod", k, n, rem);
@@ -472,7 +473,7 @@ static void run_one_prime(ulong p, const std::string& prime_label, const Options
                           << ", ms/item=" << std::setprecision(9) << (t.avg_ms / (double)n)
                           << ", fp=0x" << std::hex << t.fingerprint << std::dec << "\n";
             };
-            pr("product_roots", prod);
+            pr("subproduct_build", prod);
             pr("poly_mul", mul);
             pr("poly_divrem", div);
             pr("poly_mod", rem);
