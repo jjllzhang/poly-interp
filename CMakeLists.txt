@@ -64,6 +64,22 @@ else()
   target_compile_definitions(ops_bench PRIVATE NDEBUG)
 endif()
 
+# ---- Kronecker mul experiment (GMP) ----
+find_library(GMP_LIBRARY gmp)
+find_library(GMPXX_LIBRARY gmpxx)
+if(GMP_LIBRARY AND GMPXX_LIBRARY)
+  add_executable(kronecker_mul_bench bench/kronecker_mul_bench.cpp)
+  target_link_libraries(kronecker_mul_bench PRIVATE poly_interp ${GMPXX_LIBRARY} ${GMP_LIBRARY})
+  if (NOT MSVC)
+    target_compile_options(kronecker_mul_bench PRIVATE -O3 -DNDEBUG -march=native)
+  else()
+    target_compile_options(kronecker_mul_bench PRIVATE /O2)
+    target_compile_definitions(kronecker_mul_bench PRIVATE NDEBUG)
+  endif()
+else()
+  message(STATUS "GMP/GMPXX not found; skipping kronecker_mul_bench target.")
+endif()
+
 # ---- FLINT benchmark (external dependency) ----
 if(PI_ENABLE_FLINT_BENCH)
   find_path(FLINT_INCLUDE_DIR flint/flint.h)
