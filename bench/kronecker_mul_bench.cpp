@@ -1,7 +1,7 @@
 #include <poly_interp/prime_field.hpp>
 #include <poly_interp/fp_poly.hpp>
 
-#include <gmpxx.h>
+#include <gmp.h>
 
 #include <algorithm>
 #include <chrono>
@@ -64,6 +64,8 @@ static u64 poly_fingerprint(const FpPoly& f) {
     return h;
 }
 
+using u128 = unsigned __int128;
+
 // ------------------------------ Kronecker mul ------------------------------
 static unsigned choose_base_bits(u64 modulus, std::size_t min_len) {
     // Upper bound: max coeff <= min_len * (p-1)^2. Take a couple safety bits.
@@ -74,11 +76,131 @@ static unsigned choose_base_bits(u64 modulus, std::size_t min_len) {
     return bits;
 }
 
-static void pack_poly(mpz_t out, const std::vector<Fp>& coeffs, unsigned base_bits) {
-    mpz_set_ui(out, 0);
-    for (std::size_t i = coeffs.size(); i-- > 0;) {
-        mpz_mul_2exp(out, out, base_bits);
-        mpz_add_ui(out, out, coeffs[i].v);
+// mask helper that avoids UB on shift==64
+static inline mp_limb_t mask_bits(unsigned bits) {
+    if (bits == 0) return 0;
+    if (bits >= GMP_NUMB_BITS) return ~(mp_limb_t)0;
+    return ((mp_limb_t)1 << bits) - 1;
+}
+
+// Pack coefficients into contiguous bits (base 2^base_bits) and import once.
+// Thread-local scratch to reuse buffers and pow2 tables during pack/unpack.
+struct PackScratch {
+    std::vector<u64> pow2; // 2^k mod p for current base_bits/mod
+    unsigned pow_bits = 0;
+    u64 pow_mod = 0;
+
+    void ensure_pow2(unsigned bits, u64 mod) {
+        if (pow_bits == bits && pow_mod == mod && !pow2.empty()) return;
+        pow_bits = bits;
+        pow_mod = mod;
+        pow2.assign(bits + 1, 0);
+        pow2[0] = 1 % mod;
+        for (unsigned i = 1; i <= bits; ++i) {
+            pow2[i] = (u64)((u128)pow2[i - 1] * 2 % mod);
+        }
+    }
+};
+
+struct MpnScratch {
+    std::vector<mp_limb_t> A;
+    std::vector<mp_limb_t> B;
+    std::vector<mp_limb_t> C;
+};
+
+static mp_size_t pack_poly_bits(std::vector<mp_limb_t>& out,
+                                const std::vector<Fp>& coeffs,
+                                unsigned base_bits) {
+    if (coeffs.empty()) {
+        out.clear();
+        return 0;
+    }
+
+    const unsigned limb_bits = GMP_NUMB_BITS;
+    const std::size_t total_bits = (std::size_t)coeffs.size() * (std::size_t)base_bits;
+    const std::size_t limb_count = (total_bits + limb_bits - 1) / limb_bits;
+
+    out.assign(limb_count, 0);
+
+    for (std::size_t i = 0; i < coeffs.size(); ++i) {
+        u128 val = (u128)coeffs[i].v;
+        std::size_t bitpos = (std::size_t)i * (std::size_t)base_bits;
+        std::size_t idx = bitpos / limb_bits;
+        unsigned offset = (unsigned)(bitpos % limb_bits);
+
+        unsigned consumed = 0;
+        unsigned bits_left = base_bits;
+        while (bits_left > 0) {
+            const unsigned take = std::min<unsigned>(bits_left, limb_bits - offset);
+            mp_limb_t chunk = 0;
+            if (consumed < 128) { // u128 width guard
+                const unsigned safe_take = std::min<unsigned>(take, 128 - consumed);
+                chunk = (mp_limb_t)((val >> consumed) & mask_bits(safe_take));
+            }
+            out[idx] |= (chunk << offset);
+
+            consumed += take;
+            bits_left -= take;
+            ++idx;
+            offset = 0;
+        }
+    }
+
+    mp_size_t used = (mp_size_t)limb_count;
+    while (used > 0 && out[(std::size_t)used - 1] == 0) --used;
+    if (used == 0) used = 1; // keep at least one limb live
+    return used;
+}
+
+// Export bits and recover coefficients modulo p.
+static void unpack_poly_bits(std::vector<Fp>& out,
+                             const mp_limb_t* limbs,
+                             mp_size_t limb_count,
+                             unsigned base_bits,
+                             const FpCtx& F,
+                             PackScratch& S) {
+    const unsigned limb_bits = GMP_NUMB_BITS;
+    const std::size_t limb_count_s = (limb_count > 0) ? (std::size_t)limb_count : 0;
+
+    if (limb_count_s == 0 || limbs == nullptr) {
+        for (auto& x : out) x = F.zero();
+        return;
+    }
+
+    // Precompute 2^k mod p up to base_bits.
+    const u64 mod = F.modulus();
+    S.ensure_pow2(base_bits, mod);
+
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const std::size_t bitpos = (std::size_t)i * (std::size_t)base_bits;
+        std::size_t idx = bitpos / limb_bits;
+        if (idx >= limb_count_s) {
+            out[i] = F.zero();
+            continue;
+        }
+        unsigned offset = (unsigned)(bitpos % limb_bits);
+
+        unsigned collected = 0;
+        u64 acc_mod = 0;
+        while (collected < base_bits && idx < limb_count_s) {
+            const unsigned take = std::min<unsigned>(base_bits - collected, limb_bits - offset);
+            const mp_limb_t limb = limbs[idx];
+            mp_limb_t chunk = limb >> offset;
+            if (take < GMP_NUMB_BITS) {
+                chunk &= mask_bits(take);
+            }
+
+            // acc_mod = acc_mod + chunk * 2^{collected} (mod p)
+            const u64 term = (u64)((u128)(chunk % mod) * (u128)S.pow2[collected] % mod);
+            acc_mod += term;
+            if (acc_mod >= mod) acc_mod -= mod;
+
+            collected += take;
+            ++idx;
+            offset = 0;
+        }
+
+        out[i] = F.from_uint(acc_mod);
     }
 }
 
@@ -96,33 +218,27 @@ static FpPoly mul_kronecker(const FpPoly& a, const FpPoly& b, unsigned* used_bas
     const unsigned base_bits = choose_base_bits(F.modulus(), min_len);
     if (used_base_bits) *used_base_bits = base_bits;
 
-    mpz_t A, B, C, tmp, rem;
-    mpz_init(A);
-    mpz_init(B);
-    mpz_init(C);
-    mpz_init(tmp);
-    mpz_init(rem);
+    static thread_local MpnScratch S;
+    static thread_local PackScratch PS;
 
-    pack_poly(A, a.coeffs(), base_bits);
-    pack_poly(B, b.coeffs(), base_bits);
+    const mp_size_t limbs_a = pack_poly_bits(S.A, a.coeffs(), base_bits);
+    const mp_size_t limbs_b = pack_poly_bits(S.B, b.coeffs(), base_bits);
 
-    mpz_mul(C, A, B);
+    const mp_size_t limbs_res = limbs_a + limbs_b;
+    S.C.resize((std::size_t)limbs_res);
 
-    std::vector<Fp> out(n + m - 1, F.zero());
-
-    mpz_set(tmp, C);
-    for (std::size_t i = 0; i < out.size(); ++i) {
-        mpz_tdiv_r_2exp(rem, tmp, base_bits);
-        unsigned long coeff_mod_p = mpz_tdiv_ui(rem, static_cast<unsigned long>(F.modulus()));
-        out[i] = F.from_uint(coeff_mod_p);
-        mpz_tdiv_q_2exp(tmp, tmp, base_bits);
+    if (limbs_a >= limbs_b) {
+        mpn_mul(S.C.data(), S.A.data(), limbs_a, S.B.data(), limbs_b);
+    } else {
+        mpn_mul(S.C.data(), S.B.data(), limbs_b, S.A.data(), limbs_a);
     }
 
-    mpz_clear(rem);
-    mpz_clear(tmp);
-    mpz_clear(C);
-    mpz_clear(B);
-    mpz_clear(A);
+    mp_size_t used_limbs = limbs_res;
+    while (used_limbs > 0 && S.C[(std::size_t)used_limbs - 1] == 0) --used_limbs;
+    if (used_limbs == 0) used_limbs = 1;
+
+    std::vector<Fp> out(n + m - 1, F.zero());
+    unpack_poly_bits(out, S.C.data(), used_limbs, base_bits, F, PS);
 
     FpPoly res(F, std::move(out));
     res.trim();
@@ -140,15 +256,31 @@ struct Timings {
 static FpPoly random_poly(const FpCtx& F,
                           std::size_t len,
                           std::mt19937_64& rng,
-                          std::uniform_int_distribution<u64>& dist) {
+                          std::uniform_int_distribution<u64>& dist_nonzero) {
     std::vector<Fp> c(len);
-    for (std::size_t i = 0; i < len; ++i) c[i] = Fp{dist(rng)};
-    // force leading coeff non-zero
-    if (len > 0 && c.back().v == 0) {
-        c.back().v = (dist(rng) % (F.modulus() - 1)) + 1;
-    }
+    for (std::size_t i = 0; i < len; ++i) c[i] = Fp{dist_nonzero(rng)};
+    // distribution already excludes zero; guard in case of future changes
+    if (len > 0 && c.back().v == 0) c.back().v = 1;
     FpPoly p(F, std::move(c));
     return p;
+}
+
+static void warmup_baseline_mul(const FpPoly& a, const FpPoly& b, int iters) {
+    volatile u64 sink = 0;
+    for (int i = 0; i < iters; ++i) {
+        FpPoly r = a.mul(b);
+        sink ^= poly_fingerprint(r);
+    }
+    if (sink == 0xdeadbeefULL) std::cerr << "sink\n";
+}
+
+static void warmup_kron_mul(const FpPoly& a, const FpPoly& b, int iters) {
+    volatile u64 sink = 0;
+    for (int i = 0; i < iters; ++i) {
+        FpPoly r = mul_kronecker(a, b);
+        sink ^= poly_fingerprint(r);
+    }
+    if (sink == 0xdeadbeefULL) std::cerr << "sink\n";
 }
 
 static Timings bench_mul_baseline(const std::vector<FpPoly>& a,
@@ -157,6 +289,8 @@ static Timings bench_mul_baseline(const std::vector<FpPoly>& a,
     t.min_ms = 1e300;
     volatile u64 sink = 0;
     const int repeats = static_cast<int>(a.size());
+
+    if (repeats > 0) warmup_baseline_mul(a[0], b[0], 1);
 
     for (int rep = 0; rep < repeats; ++rep) {
         auto t0 = std::chrono::steady_clock::now();
@@ -182,6 +316,8 @@ static Timings bench_mul_kronecker(const std::vector<FpPoly>& a,
     volatile u64 sink = 0;
     const int repeats = static_cast<int>(a.size());
 
+    if (repeats > 0) warmup_kron_mul(a[0], b[0], 1);
+
     unsigned bb = 0;
     for (int rep = 0; rep < repeats; ++rep) {
         unsigned used_bits = 0;
@@ -206,7 +342,7 @@ struct Options {
     std::string prime_mode = "61"; // 31 | 61
     int min_pow = 12;
     int max_pow = 16;
-    int repeats = 2;
+    int repeats = 3;
     u64 seed = 1234567;
     bool csv = false;
     bool verify = true;
@@ -277,7 +413,7 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
     }
 
     std::mt19937_64 rng(opt.seed ^ (p + 0x9e3779b97f4a7c15ULL));
-    std::uniform_int_distribution<u64> dist(0, p - 1);
+    std::uniform_int_distribution<u64> dist_nonzero(1, p - 1);
 
     for (int k = opt.min_pow; k <= opt.max_pow; ++k) {
         const std::size_t n = (std::size_t)1ULL << (unsigned)k;
@@ -286,8 +422,8 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
         a.reserve(opt.repeats);
         b.reserve(opt.repeats);
         for (int rep = 0; rep < opt.repeats; ++rep) {
-            a.push_back(random_poly(F, n, rng, dist));
-            b.push_back(random_poly(F, n, rng, dist));
+            a.push_back(random_poly(F, n, rng, dist_nonzero));
+            b.push_back(random_poly(F, n, rng, dist_nonzero));
         }
 
         Timings base = bench_mul_baseline(a, b);
