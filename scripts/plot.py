@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # no-GUI backend
 import matplotlib.pyplot as plt
-from typing import Optional
+from typing import List, Optional, Sequence
 
 
 def _load_csv(csv_path: str) -> Optional[pd.DataFrame]:
@@ -28,6 +28,66 @@ def _basename_label(path: str) -> str:
     return base or "ops"
 
 
+def _normalize_interp_df(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """
+    Normalize various interp CSV layouts into a common schema:
+    columns: source, prime, n, build_time_ms, interp_time_ms, total_time_ms.
+    """
+    if df is None:
+        return pd.DataFrame()
+
+    df = df.copy()
+    if "prime" in df.columns:
+        df = df[df["prime"] != "prime"].copy()
+        df["prime"] = df["prime"].astype(str).str.upper()
+    else:
+        df["prime"] = "UNKNOWN"
+
+    numeric_cols = [
+        "n_pow", "n", "degree",
+        "build_tree_ms", "build_ms",
+        "interp_pre_ms", "interp_core_avg_ms", "interp_core_min_ms", "interp_core_max_ms",
+        "interp_avg_ms", "interp_min_ms", "interp_max_ms",
+        "interp_ms_per_point", "interp_ms",
+        "differentiate_ms", "evaluate_diff_ms", "interpolation_ms",
+        "total_ms",
+    ]
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "n" not in df.columns:
+        if "degree" in df.columns:
+            df["n"] = df["degree"] + 1
+        elif "n_pow" in df.columns:
+            df["n"] = 2 ** df["n_pow"]
+
+    build_col = "build_tree_ms" if "build_tree_ms" in df.columns else ("build_ms" if "build_ms" in df.columns else None)
+    interp_col = "interp_avg_ms" if "interp_avg_ms" in df.columns else ("interp_ms" if "interp_ms" in df.columns else None)
+    if build_col:
+        df["build_time_ms"] = df[build_col]
+    if interp_col:
+        df["interp_time_ms"] = df[interp_col]
+    if "total_ms" in df.columns:
+        df["total_time_ms"] = df["total_ms"]
+    elif build_col and interp_col:
+        df["total_time_ms"] = df["build_time_ms"] + df["interp_time_ms"]
+
+    df["source"] = source
+    required = ["n", "build_time_ms", "interp_time_ms"]
+    df = df.dropna(subset=required).copy()
+    if "total_time_ms" not in df.columns:
+        df["total_time_ms"] = df["build_time_ms"] + df["interp_time_ms"]
+
+    keep_cols = ["source", "prime", "n", "build_time_ms", "interp_time_ms", "total_time_ms"]
+    extra_cols = [c for c in ["interp_pre_ms", "interp_core_avg_ms", "interp_ms_per_point"] if c in df.columns]
+    missing = [c for c in keep_cols if c not in df.columns]
+    if missing:
+        print(f"Warning: skipping source '{source}' due to missing columns: {', '.join(missing)}")
+        return pd.DataFrame()
+    return df[keep_cols + extra_cols]
+
+
 def plot_interp_csv(csv_path: str, logy: bool = True, output_dir: str = "plots") -> None:
     """
     Visualize interp_bench CSV and save figures to disk.
@@ -43,20 +103,35 @@ def plot_interp_csv(csv_path: str, logy: bool = True, output_dir: str = "plots")
         df = df[df["prime"] != "prime"].copy()
 
     num_cols = [
-        "n_pow", "n",
-        "build_tree_ms",
+        "n_pow", "n", "degree",
+        "build_tree_ms", "build_ms",
         "interp_pre_ms",
         "interp_core_avg_ms",
         "interp_core_min_ms",
         "interp_core_max_ms",
-        "interp_avg_ms",
+        "interp_avg_ms", "interp_ms",
         "interp_min_ms",
         "interp_max_ms",
         "interp_ms_per_point",
+        "differentiate_ms",
+        "evaluate_diff_ms",
+        "interpolation_ms",
+        "total_ms",
     ]
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "n" not in df.columns:
+        if "degree" in df.columns:
+            df["n"] = df["degree"] + 1
+        elif "n_pow" in df.columns:
+            df["n"] = 2 ** df["n_pow"]
+
+    if "build_tree_ms" not in df.columns and "build_ms" in df.columns:
+        df["build_tree_ms"] = df["build_ms"]
+    if "interp_avg_ms" not in df.columns and "interp_ms" in df.columns:
+        df["interp_avg_ms"] = df["interp_ms"]
 
     df = df.dropna(subset=["n"]).copy()
     if df.empty:
@@ -101,64 +176,57 @@ def plot_interp_csv(csv_path: str, logy: bool = True, output_dir: str = "plots")
     _plot("interp_ms_per_point", "interpolation time per point (ms)")
 
 
-def plot_interp_compare(csv_a: str, csv_b: str, logy: bool = True, output_dir: str = "plots",
-                        label_a: str = None, label_b: str = None) -> None:
+def plot_interp_compare(csv_paths: Sequence[str], labels: Optional[Sequence[str]] = None,
+                        logy: bool = True, output_dir: str = "plots") -> None:
     """
-    Compare two interp-like CSVs on the same plots (e.g., project vs FLINT).
+    Compare multiple interp-like CSVs on the same plots (e.g., project vs FLINT vs NTL).
     """
     os.makedirs(output_dir, exist_ok=True)
-
-    df_a = _load_csv(csv_a)
-    df_b = _load_csv(csv_b)
-    if df_a is None or df_b is None:
+    if not csv_paths:
+        print("Error: no CSV paths provided for comparison.")
         return
 
-    def _clean(df: pd.DataFrame) -> pd.DataFrame:
-        if "prime" in df.columns:
-            df = df[df["prime"] != "prime"].copy()
-        num_cols = [
-            "n_pow", "n",
-            "build_tree_ms",
-            "interp_pre_ms",
-            "interp_core_avg_ms",
-            "interp_core_min_ms",
-            "interp_core_max_ms",
-            "interp_avg_ms",
-            "interp_min_ms",
-            "interp_max_ms",
-            "interp_ms_per_point",
-        ]
-        for c in num_cols:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df.dropna(subset=["n"]).copy()
+    labels = list(labels or [])
+    frames: List[pd.DataFrame] = []
+    for idx, path in enumerate(csv_paths):
+        df_raw = _load_csv(path)
+        if df_raw is None:
+            continue
+        label = labels[idx] if idx < len(labels) else _basename_label(path)
+        df_norm = _normalize_interp_df(df_raw, label)
+        if df_norm.empty:
+            print(f"Skip: '{path}' has no valid rows after cleaning.")
+            continue
+        frames.append(df_norm)
 
-    df_a = _clean(df_a)
-    df_b = _clean(df_b)
-    if df_a.empty or df_b.empty:
-        print("Error: one of the CSVs has no valid rows after cleaning.")
+    if not frames:
+        print("Error: no valid rows after cleaning CSVs.")
         return
 
-    la = label_a or _basename_label(csv_a)
-    lb = label_b or _basename_label(csv_b)
-    df_a["source"] = la
-    df_b["source"] = lb
+    df = pd.concat(frames, ignore_index=True)
+    df = df.sort_values(["source", "prime", "n"])
 
-    df = pd.concat([df_a, df_b], ignore_index=True)
-    df = df.sort_values(["op" if "op" in df.columns else "prime", "n"])
+    metrics = [
+        ("build_time_ms", "build tree time (ms)"),
+        ("interp_time_ms", "interpolation time (ms)"),
+        ("total_time_ms", "build + interpolation total time (ms)"),
+    ]
+    metrics.extend([
+        ("interp_pre_ms", "interp precompute time (ms)"),
+        ("interp_core_avg_ms", "interp core time avg (ms)"),
+        ("interp_ms_per_point", "interpolation time per point (ms)"),
+    ])
 
     def _plot(metric: str, ylabel: str) -> None:
         if metric not in df.columns:
-            print(f"Skip: column '{metric}' not found in CSV.")
+            print(f"Skip: column '{metric}' not found in merged data.")
             return
 
         plt.figure(figsize=(10, 6))
-        if "prime" in df.columns:
-            for (source, prime), g in df.groupby(["source", "prime"]):
-                plt.plot(g["n"], g[metric], marker="o", label=f"{source}-{prime}")
-        else:
-            for source, g in df.groupby("source"):
-                plt.plot(g["n"], g[metric], marker="o", label=source)
+        for (source, prime), g in df.groupby(["source", "prime"]):
+            if g[metric].isna().all():
+                continue
+            plt.plot(g["n"], g[metric], marker="o", label=f"{source}-{prime}")
 
         plt.xscale("log", base=2)
         if logy:
@@ -177,11 +245,8 @@ def plot_interp_compare(csv_a: str, csv_b: str, logy: bool = True, output_dir: s
         print(f"Saved: {save_path}")
         plt.close()
 
-    _plot("build_tree_ms", "build tree time (ms)")
-    _plot("interp_pre_ms", "interp precompute time (ms)")
-    _plot("interp_core_avg_ms", "interp core time avg (ms)")
-    _plot("interp_avg_ms", "interpolation total time avg (ms)")
-    _plot("interp_ms_per_point", "interpolation time per point (ms)")
+    for metric, ylabel in metrics:
+        _plot(metric, ylabel)
 
 
 def plot_ops_csv(csv_path: str, logy: bool = True, output_dir: str = "plots") -> None:
@@ -430,13 +495,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--compare-interp",
+        nargs="+",
         default=None,
-        help="Second interp CSV for comparison (only used with --format=interp or auto-detected interp).",
+        help="Additional interp CSVs for comparison (only used with --format=interp or auto-detected interp).",
     )
     parser.add_argument(
         "--compare-interp-label",
+        nargs="*",
         default=None,
-        help="Label for the comparison interp CSV (optional; default uses basename).",
+        help="Labels for comparison interp CSVs (order matches --compare-interp; default uses basenames).",
     )
     parser.add_argument(
         "--logy",
@@ -468,13 +535,18 @@ def main() -> None:
             fmt = "interp"
     if fmt == "interp":
         if args.compare_interp:
+            compare_paths = list(args.compare_interp)
+            compare_labels = list(args.compare_interp_label or [])
+            csv_paths = [args.csv] + compare_paths
+            labels = [_basename_label(args.csv)]
+            for idx, path in enumerate(compare_paths):
+                label = compare_labels[idx] if idx < len(compare_labels) else _basename_label(path)
+                labels.append(label)
             plot_interp_compare(
-                args.csv,
-                args.compare_interp,
+                csv_paths,
+                labels=labels,
                 logy=logy,
                 output_dir=args.outdir,
-                label_a=_basename_label(args.csv),
-                label_b=args.compare_interp_label or _basename_label(args.compare_interp),
             )
         else:
             plot_interp_csv(args.csv, logy=logy, output_dir=args.outdir)

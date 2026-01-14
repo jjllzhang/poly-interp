@@ -48,7 +48,7 @@ plot-interp: release
 
 plot-interp-compare:
 	mkdir -p plots/interp_compare
-	python3 scripts/plot.py data/bench.csv plots/interp_compare --format=interp --compare-interp data/bench_flint.csv --logy
+	python3 scripts/plot.py data/bench.csv plots/interp_compare --format=interp --compare-interp data/bench_flint.csv data/bench_NTL.csv --compare-interp-label flint ntl --logy
 
 plot-flint: release
 	cmake --build --preset release --target plot_flint
