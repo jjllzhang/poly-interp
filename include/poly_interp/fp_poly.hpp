@@ -1923,32 +1923,64 @@ inline FpPoly FpPoly::interpolate_lagrange_naive(const FpCtx& ctx,
     for (auto& x : X) x.v %= ctx.modulus();
     for (auto& y : Y) y.v %= ctx.modulus();
 
-    // result = Σ y_i * Π_{j!=i} (x-x_j)/(x_i-x_j)
-    for (std::size_t i = 0; i < n; ++i) {
-        FpPoly numer(ctx, {1}); // 1
-        Fp denom = ctx.one();
-
-        for (std::size_t j = 0; j < n; ++j) {
-            if (j == i) continue;
-
-            // numer *= (x - x_j)
-            FpPoly lin(ctx);
-            lin.coeffs_mut().reserve(2);
-            lin.coeffs_mut().push_back(ctx.neg(X[j]));
-            lin.coeffs_mut().push_back(ctx.one());
-            lin.trim();
-            numer = numer.mul(lin);
-
-            // denom *= (x_i - x_j)
-            denom = ctx.mul(denom, ctx.sub(X[i], X[j]));
-        }
-
-        Fp scale = ctx.div(Y[i], denom); // y_i / denom
-        result = result.add(numer.scalar_mul(scale));
+    // G(x) = Π (x - x_j)  [degree n]
+    FpPoly G(ctx, {ctx.one()});
+    for (std::size_t j = 0; j < n; ++j) {
+        FpPoly lin(ctx);
+        lin.coeffs_mut().reserve(2);
+        lin.coeffs_mut().push_back(ctx.neg(X[j]));
+        lin.coeffs_mut().push_back(ctx.one());
+        lin.trim();
+        G = G.mul(lin);
     }
 
-    result.trim();
-    return result;
+    // dG(x_i) = Π_{j!=i} (x_i - x_j)  (O(n^2) via naive multipoint eval)
+    FpPoly dG = G.derivative();
+    std::vector<Fp> dG_vals = dG.multipoint_eval_naive(X);
+    if (dG_vals.size() != n) {
+        throw std::logic_error("interpolate_lagrange_naive: unexpected dG size");
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        if (dG_vals[i].v == 0) {
+            throw std::domain_error("interpolate_lagrange_naive: duplicate points (dG(x_i)=0)");
+        }
+    }
+
+    // a_i = y_i / dG(x_i)
+    std::vector<Fp> weights(n, ctx.zero());
+    for (std::size_t i = 0; i < n; ++i) {
+        weights[i] = ctx.div(Y[i], dG_vals[i]);
+    }
+
+    // Synthetic division helper: G / (x - xi) (monic divisor), returns degree n-1 quotient.
+    const auto& gc = G.coeffs();
+    if (gc.size() != n + 1) {
+        throw std::logic_error("interpolate_lagrange_naive: unexpected G degree");
+    }
+    auto divide_by_linear = [&](Fp xi) {
+        std::vector<Fp> q(n, ctx.zero());
+        q[n - 1] = gc[n]; // leading coeff
+        for (std::size_t k = n - 1; k > 0; --k) {
+            // q[k-1] = gc[k] + xi * q[k]
+            Fp t = ctx.mul(xi, q[k]);
+            q[k - 1] = ctx.add(gc[k], t);
+        }
+        return q;
+    };
+
+    std::vector<Fp> res(n, ctx.zero()); // degree <= n-1
+    for (std::size_t i = 0; i < n; ++i) {
+        std::vector<Fp> q = divide_by_linear(X[i]); // G(x)/(x - x_i)
+        const Fp wi = weights[i];
+        if (wi.v == 0) continue;
+        for (std::size_t k = 0; k < n; ++k) {
+            res[k] = ctx.add(res[k], ctx.mul(wi, q[k]));
+        }
+    }
+
+    FpPoly out(ctx, std::move(res));
+    out.trim();
+    return out;
 }
 
 inline FpPoly FpPoly::interpolate_subproduct_tree(const SubproductTree& tree,

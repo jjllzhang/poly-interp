@@ -1,4 +1,4 @@
-.PHONY: release debug test bench-interp bench-ops bench-ops-flint bench-flint kronecker-build bench-kronecker plot-interp plot-interp-compare plot-ops plot-ops-flint plot-ops-compare plot-flint clean
+.PHONY: release debug test bench-interp bench-interp-naive bench-ops bench-ops-flint bench-flint kronecker-build bench-kronecker plot-interp plot-interp-compare plot-ops plot-ops-flint plot-ops-compare plot-flint clean
 
 release:
 	cmake --preset release
@@ -14,6 +14,10 @@ test: release
 bench-interp: release
 	mkdir -p data
 	./build/release/interp_bench --prime=all --min_pow=10 --max_pow=20 --repeats=3 --csv=1 > data/bench.csv
+
+bench-interp-naive: release
+	mkdir -p data
+	./build/release/interp_bench --method=naive --prime=all --min_pow=10 --max_pow=16 --repeats=1 --csv=1 > data/bench_naive.csv
 
 bench-ops: release
 	mkdir -p data

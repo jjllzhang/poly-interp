@@ -18,6 +18,11 @@ using pf::FpCtx;
 using pf::FpPoly;
 using pf::u64;
 
+enum class InterpMethod {
+    SubproductTree,
+    NaiveLagrange
+};
+
 static u64 mersenne31() { return (1ULL << 31) - 1; }                 // 2^31 - 1
 static u64 mersenne61() { return (1ULL << 61) - 1; }                 // 2^61 - 1
 
@@ -38,6 +43,7 @@ struct Options {
     // prime_mode = "31" / "61" / "all" / "custom"
     std::string prime_mode = "61";
     u64 custom_p = 0;
+    InterpMethod method = InterpMethod::SubproductTree;
 
     int min_pow = 10;
     int max_pow = 20;
@@ -57,6 +63,7 @@ static void print_help(const char* argv0) {
         << "Options:\n"
         << "  --prime=31|61|all        choose Mersenne prime (default: 61)\n"
         << "  --p=<uint64>             custom prime modulus (no primality check)\n"
+        << "  --method=tree|naive      interpolation method (default: tree)\n"
         << "  --min_pow=<k>            min k where n=2^k (default: 10)\n"
         << "  --max_pow=<k>            max k where n=2^k (default: 20)\n"
         << "  --repeats=<r>            repeats for interpolation per n (default: 3)\n"
@@ -65,7 +72,7 @@ static void print_help(const char* argv0) {
         << "  --csv=0|1                output CSV (default: 1)\n"
         << "  --help                   show this help\n\n"
         << "Notes:\n"
-        << "  With current naive poly mul/div/mod, large n (e.g. 2^18..2^20) will be extremely slow.\n";
+        << "  --method=naive runs O(n^2) Lagrange interpolation; use smaller n (e.g. k<=14) to avoid long runtimes.\n";
 }
 
 static Options parse_args(int argc, char** argv) {
@@ -85,6 +92,15 @@ static Options parse_args(int argc, char** argv) {
         } else if (starts_with(a, "--p=")) {
             opt.prime_mode = "custom";
             opt.custom_p = parse_u64(a.substr(std::strlen("--p=")));
+        } else if (starts_with(a, "--method=")) {
+            std::string m = a.substr(std::strlen("--method="));
+            if (m == "tree") {
+                opt.method = InterpMethod::SubproductTree;
+            } else if (m == "naive") {
+                opt.method = InterpMethod::NaiveLagrange;
+            } else {
+                throw std::invalid_argument("unknown --method=..., expected tree|naive");
+            }
         } else if (starts_with(a, "--min_pow=")) {
             opt.min_pow = static_cast<int>(parse_u64(a.substr(std::strlen("--min_pow="))));
         } else if (starts_with(a, "--max_pow=")) {
@@ -149,6 +165,8 @@ static u64 poly_fingerprint(const FpPoly& f) {
 
 static void run_one_prime(u64 p, const std::string& prime_label, const Options& opt) {
     FpCtx F(p);
+    const bool method_naive = (opt.method == InterpMethod::NaiveLagrange);
+    const std::string label = method_naive ? (prime_label + "-naive") : prime_label;
 
     // 输出表头
     if (opt.csv) {
@@ -165,8 +183,10 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
             << "interp_ms_per_point,"
             << "fingerprint\n";
     } else {
-        std::cout << "Prime " << prime_label << " (p=" << p << ")\n";
-        std::cout << "n=2^k, k in [" << opt.min_pow << "," << opt.max_pow << "], repeats=" << opt.repeats << "\n";
+        std::cout << "Prime " << prime_label << " (p=" << p << "), method="
+                  << (method_naive ? "naive-lagrange" : "subproduct-tree") << "\n";
+        std::cout << "n=2^k, k in [" << opt.min_pow << "," << opt.max_pow
+                  << "], repeats=" << opt.repeats << "\n";
     }
 
     std::mt19937_64 rng(opt.seed ^ (p + 0x9e3779b97f4a7c15ULL));
@@ -184,17 +204,17 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
             xs[i] = Fp{ static_cast<u64>(i) };
         }
 
-        // 1) build tree timing
+        // 1) build tree timing（naive 跳过）
         double build_ms = 0.0;
         FpPoly::SubproductTree tree;
-        {
+        if (!method_naive) {
             auto t0 = std::chrono::steady_clock::now();
             tree = FpPoly::SubproductTree::build(F, xs);
             auto t1 = std::chrono::steady_clock::now();
             build_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         }
 
-        // 2) interpolation timing (tree reused)
+        // 2) interpolation timing
         double precompute_ms = 0.0;  // measured once per n
         bool precomputed = false;
         double core_sum_ms = 0.0;
@@ -211,20 +231,27 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
 
             FpPoly poly(F);
 
-            double pre_ms_this = 0.0;
-            if (!precomputed) {
-                auto tpre0 = std::chrono::steady_clock::now();
-                tree.inv_derivative_vals();
-                auto tpre1 = std::chrono::steady_clock::now();
-                pre_ms_this = std::chrono::duration<double, std::milli>(tpre1 - tpre0).count();
-                precompute_ms = pre_ms_this;
-                precomputed = true;
+            double core_ms = 0.0;
+            if (!method_naive) {
+                double pre_ms_this = 0.0;
+                if (!precomputed) {
+                    auto tpre0 = std::chrono::steady_clock::now();
+                    tree.inv_derivative_vals();
+                    auto tpre1 = std::chrono::steady_clock::now();
+                    pre_ms_this = std::chrono::duration<double, std::milli>(tpre1 - tpre0).count();
+                    precompute_ms = pre_ms_this;
+                    precomputed = true;
+                }
+                auto tcore0 = std::chrono::steady_clock::now();
+                poly = FpPoly::interpolate_subproduct_tree(tree, ys);
+                auto tcore1 = std::chrono::steady_clock::now();
+                core_ms = std::chrono::duration<double, std::milli>(tcore1 - tcore0).count();
+            } else {
+                auto tcore0 = std::chrono::steady_clock::now();
+                poly = FpPoly::interpolate_lagrange_naive(F, xs, ys);
+                auto tcore1 = std::chrono::steady_clock::now();
+                core_ms = std::chrono::duration<double, std::milli>(tcore1 - tcore0).count();
             }
-            auto tcore0 = std::chrono::steady_clock::now();
-            poly = FpPoly::interpolate_subproduct_tree(tree, ys);
-            auto tcore1 = std::chrono::steady_clock::now();
-
-            const double core_ms = std::chrono::duration<double, std::milli>(tcore1 - tcore0).count();
 
             core_sum_ms += core_ms;
             core_min_ms = std::min(core_min_ms, core_ms);
@@ -259,7 +286,7 @@ static void run_one_prime(u64 p, const std::string& prime_label, const Options& 
 
         if (opt.csv) {
             std::cout
-                << prime_label << "," << prime_label << ","
+                << prime_label << "," << label << ","
                 << k << "," << n << ","
                 << std::fixed << std::setprecision(3)
                 << build_ms << ","
