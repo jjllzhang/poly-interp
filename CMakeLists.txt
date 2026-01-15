@@ -68,6 +68,8 @@ endif()
 find_library(GMP_LIBRARY gmp)
 find_library(GMPXX_LIBRARY gmpxx)
 if(GMP_LIBRARY AND GMPXX_LIBRARY)
+  target_link_libraries(interp_bench PRIVATE ${GMPXX_LIBRARY} ${GMP_LIBRARY})
+  target_compile_definitions(interp_bench PRIVATE PI_HAVE_GMP)
   add_executable(kronecker_mul_bench bench/kronecker_mul_bench.cpp)
   target_link_libraries(kronecker_mul_bench PRIVATE poly_interp ${GMPXX_LIBRARY} ${GMP_LIBRARY})
   if (NOT MSVC)
@@ -77,7 +79,7 @@ if(GMP_LIBRARY AND GMPXX_LIBRARY)
     target_compile_definitions(kronecker_mul_bench PRIVATE NDEBUG)
   endif()
 else()
-  message(STATUS "GMP/GMPXX not found; skipping kronecker_mul_bench target.")
+  message(STATUS "GMP/GMPXX not found; skipping kronecker_mul_bench target and using built-in multiplication in interp_bench.")
 endif()
 
 # ---- FLINT benchmark (external dependency) ----
@@ -112,11 +114,11 @@ if(PI_ENABLE_FLINT_BENCH)
 endif()
 
 # Convenience target: build + run bench to data/bench.csv
-# Convenience targets: plot interp bench / plot flint bench (requires python + scripts/plot.py).
+# Convenience targets: plot interp bench / plot flint bench (requires python + scripts/plot_bench.py).
 # Assumes corresponding CSV already exists.
 add_custom_target(plot_interp
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_SOURCE_DIR}/plots/interp
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/plot.py
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/plot_bench.py
           ${CMAKE_CURRENT_SOURCE_DIR}/data/bench.csv
           ${CMAKE_CURRENT_SOURCE_DIR}/plots/interp
           --format=interp
@@ -126,7 +128,7 @@ add_custom_target(plot_interp
 
 add_custom_target(plot_flint
   COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_SOURCE_DIR}/plots/flint
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/plot.py
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/plot_bench.py
           ${CMAKE_CURRENT_SOURCE_DIR}/data/bench_flint.csv
           ${CMAKE_CURRENT_SOURCE_DIR}/plots/flint
           --format=flint

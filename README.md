@@ -34,7 +34,11 @@ ctest --preset release
   - `make plot-ops` (reads `data/bench_ops.csv`, outputs `plots/ops/`, uses log-y).
   - `make plot-ops-flint` (reads `data/bench_ops_flint.csv`, outputs `plots/ops_flint/`, uses log-y).
   - `make plot-flint` (reads `data/bench_flint.csv`, outputs `plots/flint/`).
-  - `python3 scripts/plot.py data/bench_ops_flint.csv plots/ops_flint --format=ops` (FLINT ops plots).
+  - `make plot-interp-compare` (project vs FLINT/NTL; outputs `plots/interp_compare/`).
+  - `make plot-ops-compare` (project vs FLINT ops; outputs `plots/ops_compare/`, log-y).
+  - `make plot-interp-tables` (renders `data/interp_vs_flint.md` tables into `plots/interp_tables/`).
+  - `make plot-ops-tables` (renders `data/ops_vs_flint.md` with `n_pow=20` filter into `plots/ops_tables/`).
+- Plot helpers (manual): `python3 scripts/plot_bench.py ...` for CSV plots, `python3 scripts/plot_md_tables.py ...` for markdown tables.
 
 ## Core APIs
 

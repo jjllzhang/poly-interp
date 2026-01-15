@@ -1,4 +1,4 @@
-.PHONY: release debug test bench-interp bench-interp-naive bench-ops bench-ops-flint bench-flint kronecker-build bench-kronecker plot-interp plot-interp-compare plot-ops plot-ops-flint plot-ops-compare plot-flint clean
+.PHONY: release debug test bench-interp bench-interp-naive bench-ops bench-ops-flint bench-flint kronecker-build bench-kronecker plot-interp plot-interp-compare plot-ops plot-ops-flint plot-ops-compare plot-flint plot-interp-tables plot-ops-tables clean
 
 release:
 	cmake --preset release
@@ -29,15 +29,15 @@ bench-ops-flint: release
 
 plot-ops:
 	mkdir -p plots/ops
-	python3 scripts/plot.py data/bench_ops.csv plots/ops --format=ops --logy
+	python3 scripts/plot_bench.py data/bench_ops.csv plots/ops --format=ops --logy
 
 plot-ops-flint:
 	mkdir -p plots/ops_flint
-	python3 scripts/plot.py data/bench_ops_flint.csv plots/ops_flint --format=ops --logy
+	python3 scripts/plot_bench.py data/bench_ops_flint.csv plots/ops_flint --format=ops --logy
 
 plot-ops-compare:
 	mkdir -p plots/ops_compare
-	python3 scripts/plot.py data/bench_ops.csv plots/ops_compare --format=ops --compare-ops data/bench_ops_flint.csv --logy
+	python3 scripts/plot_bench.py data/bench_ops.csv plots/ops_compare --format=ops --compare-ops data/bench_ops_flint.csv --logy
 
 bench-flint: release
 	mkdir -p data
@@ -52,10 +52,16 @@ plot-interp: release
 
 plot-interp-compare:
 	mkdir -p plots/interp_compare
-	python3 scripts/plot.py data/bench.csv plots/interp_compare --format=interp --compare-interp data/bench_flint.csv data/bench_NTL.csv --compare-interp-label flint ntl --logy
+	python3 scripts/plot_bench.py data/bench.csv plots/interp_compare --format=interp --compare-interp data/bench_flint.csv data/bench_NTL.csv --compare-interp-label flint ntl --logy
 
 plot-flint: release
 	cmake --build --preset release --target plot_flint
+
+plot-interp-tables:
+	python3 scripts/plot_md_tables.py --input data/interp_vs_flint.md --output-dir plots/interp_tables
+
+plot-ops-tables:
+	python3 scripts/plot_md_tables.py --input data/ops_vs_flint.md --output-dir plots/ops_tables --filter n_pow=20
 
 clean:
 	rm -rf build
