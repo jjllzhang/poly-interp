@@ -117,6 +117,20 @@ static mp_size_t pack_poly_bits(std::vector<mp_limb_t>& out,
     }
 
     const unsigned limb_bits = GMP_NUMB_BITS;
+    const unsigned limbs_per_coeff = (base_bits % limb_bits == 0) ? (base_bits / limb_bits) : 0;
+    if (limbs_per_coeff > 0) {
+        const std::size_t limb_count = coeffs.size() * (std::size_t)limbs_per_coeff;
+        out.assign(limb_count, 0);
+        for (std::size_t i = 0; i < coeffs.size(); ++i) {
+            // coeff fits in one limb; upper limbs stay 0
+            out[i * (std::size_t)limbs_per_coeff] = (mp_limb_t)coeffs[i].v;
+        }
+        mp_size_t used = (mp_size_t)limb_count;
+        while (used > 0 && out[(std::size_t)used - 1] == 0) --used;
+        if (used == 0) used = 1;
+        return used;
+    }
+
     const std::size_t total_bits = (std::size_t)coeffs.size() * (std::size_t)base_bits;
     const std::size_t limb_count = (total_bits + limb_bits - 1) / limb_bits;
 
@@ -164,6 +178,19 @@ static void unpack_poly_bits(std::vector<Fp>& out,
 
     if (limb_count_s == 0 || limbs == nullptr) {
         for (auto& x : out) x = F.zero();
+        return;
+    }
+
+    const unsigned limbs_per_coeff = (base_bits % limb_bits == 0) ? (base_bits / limb_bits) : 0;
+    if (limbs_per_coeff > 0) {
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            std::size_t idx = i * (std::size_t)limbs_per_coeff;
+            if (idx >= limb_count_s) {
+                out[i] = F.zero();
+            } else {
+                out[i] = F.from_uint((u64)limbs[idx] % F.modulus());
+            }
+        }
         return;
     }
 
@@ -227,7 +254,12 @@ static FpPoly mul_kronecker(const FpPoly& a, const FpPoly& b, unsigned* used_bas
     const mp_size_t limbs_res = limbs_a + limbs_b;
     S.C.resize((std::size_t)limbs_res);
 
-    if (limbs_a >= limbs_b) {
+    const bool same_operands = (&a == &b) || (a.coeffs().data() == b.coeffs().data() && a.coeffs().size() == b.coeffs().size());
+    if (same_operands) {
+        mpn_sqr(S.C.data(), S.A.data(), limbs_a);
+    } else if (limbs_a == limbs_b) {
+        mpn_mul_n(S.C.data(), S.A.data(), S.B.data(), limbs_a);
+    } else if (limbs_a > limbs_b) {
         mpn_mul(S.C.data(), S.A.data(), limbs_a, S.B.data(), limbs_b);
     } else {
         mpn_mul(S.C.data(), S.B.data(), limbs_b, S.A.data(), limbs_a);
