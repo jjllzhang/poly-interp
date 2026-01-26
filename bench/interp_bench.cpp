@@ -282,13 +282,25 @@ static void unpack_poly_bits(std::vector<Fp>& out,
 
     const unsigned limbs_per_coeff = (base_bits % limb_bits == 0) ? (base_bits / limb_bits) : 0;
     if (limbs_per_coeff > 0) {
+        const u64 mod = F.modulus();
+        S.ensure_pow2(base_bits, mod);
         for (std::size_t i = 0; i < out.size(); ++i) {
             std::size_t idx = i * (std::size_t)limbs_per_coeff;
             if (idx >= limb_count_s) {
                 out[i] = F.zero();
-            } else {
-                out[i] = F.from_uint((u64)limbs[idx] % F.modulus());
+                continue;
             }
+            u64 acc_mod = 0;
+            for (unsigned t = 0; t < limbs_per_coeff; ++t) {
+                const std::size_t limb_idx = idx + t;
+                if (limb_idx >= limb_count_s) break;
+                const u64 limb = (u64)limbs[limb_idx];
+                const unsigned bit = t * limb_bits;
+                const u64 term = (u64)((u128)(limb % mod) * (u128)S.pow2[bit] % mod);
+                acc_mod += term;
+                if (acc_mod >= mod) acc_mod -= mod;
+            }
+            out[i] = F.from_uint(acc_mod);
         }
         return;
     }

@@ -3,6 +3,9 @@
 
 #include <poly_interp/prime_field.hpp>
 
+#ifdef PI_HAVE_GMP
+#include <gmp.h>
+#endif
 
 #include <vector>
 #include <initializer_list>
@@ -942,6 +945,216 @@ inline u64 garner_crt_to_mod_p(const u32* r, u64 p) {
     return consts[K] % p;
 }
 
+#ifdef PI_HAVE_GMP
+inline unsigned choose_base_bits(u64 modulus, std::size_t min_len) {
+    // max coeff <= min_len * (p-1)^2. Add a couple safety bits.
+    double lp = std::log2(static_cast<double>(modulus));
+    double bound = 2.0 * lp + std::log2(static_cast<double>(std::max<std::size_t>(min_len, 1))) + 2.0;
+    unsigned bits = static_cast<unsigned>(std::ceil(bound));
+    if (bits < 16) bits = 16;
+    return bits;
+}
+
+inline mp_limb_t mask_bits(unsigned bits) {
+    if (bits == 0) return 0;
+    if (bits >= GMP_NUMB_BITS) return ~(mp_limb_t)0;
+    return ((mp_limb_t)1 << bits) - 1;
+}
+
+struct PackScratch {
+    std::vector<u64> pow2; // 2^k mod p for current base_bits/mod
+    unsigned pow_bits = 0;
+    u64 pow_mod = 0;
+
+    void ensure_pow2(unsigned bits, u64 mod) {
+        if (pow_bits == bits && pow_mod == mod && !pow2.empty()) return;
+        pow_bits = bits;
+        pow_mod = mod;
+        pow2.assign(bits + 1, 0);
+        pow2[0] = 1 % mod;
+        for (unsigned i = 1; i <= bits; ++i) {
+            pow2[i] = (u64)((u128)pow2[i - 1] * 2 % mod);
+        }
+    }
+};
+
+struct MpnScratch {
+    std::vector<mp_limb_t> A;
+    std::vector<mp_limb_t> B;
+    std::vector<mp_limb_t> C;
+};
+
+inline mp_size_t pack_poly_bits(std::vector<mp_limb_t>& out,
+                                const std::vector<Fp>& coeffs,
+                                unsigned base_bits) {
+    if (coeffs.empty()) {
+        out.clear();
+        return 0;
+    }
+
+    const unsigned limb_bits = GMP_NUMB_BITS;
+    const unsigned limbs_per_coeff = (base_bits % limb_bits == 0) ? (base_bits / limb_bits) : 0;
+    if (limbs_per_coeff > 0) {
+        const std::size_t limb_count = coeffs.size() * (std::size_t)limbs_per_coeff;
+        out.assign(limb_count, 0);
+        for (std::size_t i = 0; i < coeffs.size(); ++i) {
+            out[i * (std::size_t)limbs_per_coeff] = (mp_limb_t)coeffs[i].v;
+        }
+        mp_size_t used = (mp_size_t)limb_count;
+        while (used > 0 && out[(std::size_t)used - 1] == 0) --used;
+        if (used == 0) used = 1;
+        return used;
+    }
+
+    const std::size_t total_bits = (std::size_t)coeffs.size() * (std::size_t)base_bits;
+    const std::size_t limb_count = (total_bits + limb_bits - 1) / limb_bits;
+
+    out.assign(limb_count, 0);
+
+    for (std::size_t i = 0; i < coeffs.size(); ++i) {
+        u128 val = (u128)coeffs[i].v;
+        std::size_t bitpos = (std::size_t)i * (std::size_t)base_bits;
+        std::size_t idx = bitpos / limb_bits;
+        unsigned offset = (unsigned)(bitpos % limb_bits);
+
+        unsigned consumed = 0;
+        unsigned bits_left = base_bits;
+        while (bits_left > 0) {
+            const unsigned take = std::min<unsigned>(bits_left, limb_bits - offset);
+            mp_limb_t chunk = 0;
+            if (consumed < 128) { // u128 width guard
+                const unsigned safe_take = std::min<unsigned>(take, 128 - consumed);
+                chunk = (mp_limb_t)((val >> consumed) & mask_bits(safe_take));
+            }
+            out[idx] |= (chunk << offset);
+
+            consumed += take;
+            bits_left -= take;
+            ++idx;
+            offset = 0;
+        }
+    }
+
+    mp_size_t used = (mp_size_t)limb_count;
+    while (used > 0 && out[(std::size_t)used - 1] == 0) --used;
+    if (used == 0) used = 1; // keep at least one limb live
+    return used;
+}
+
+inline void unpack_poly_bits(std::vector<Fp>& out,
+                             const mp_limb_t* limbs,
+                             mp_size_t limb_count,
+                             unsigned base_bits,
+                             const FpCtx& F,
+                             PackScratch& S) {
+    const unsigned limb_bits = GMP_NUMB_BITS;
+    const std::size_t limb_count_s = (limb_count > 0) ? (std::size_t)limb_count : 0;
+
+    if (limb_count_s == 0 || limbs == nullptr) {
+        for (auto& x : out) x = F.zero();
+        return;
+    }
+
+    const unsigned limbs_per_coeff = (base_bits % limb_bits == 0) ? (base_bits / limb_bits) : 0;
+    if (limbs_per_coeff > 0) {
+        const u64 mod = F.modulus();
+        S.ensure_pow2(base_bits, mod);
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            std::size_t idx = i * (std::size_t)limbs_per_coeff;
+            if (idx >= limb_count_s) {
+                out[i] = F.zero();
+                continue;
+            }
+            u64 acc_mod = 0;
+            for (unsigned t = 0; t < limbs_per_coeff; ++t) {
+                const std::size_t limb_idx = idx + t;
+                if (limb_idx >= limb_count_s) break;
+                const u64 limb = (u64)limbs[limb_idx];
+                const unsigned bit = t * limb_bits;
+                const u64 term = (u64)((u128)(limb % mod) * (u128)S.pow2[bit] % mod);
+                acc_mod += term;
+                if (acc_mod >= mod) acc_mod -= mod;
+            }
+            out[i] = F.from_uint(acc_mod);
+        }
+        return;
+    }
+
+    const u64 mod = F.modulus();
+    S.ensure_pow2(base_bits, mod);
+
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const std::size_t bitpos = (std::size_t)i * (std::size_t)base_bits;
+        std::size_t idx = bitpos / limb_bits;
+        if (idx >= limb_count_s) {
+            out[i] = F.zero();
+            continue;
+        }
+        unsigned offset = (unsigned)(bitpos % limb_bits);
+
+        unsigned collected = 0;
+        u64 acc_mod = 0;
+        while (collected < base_bits && idx < limb_count_s) {
+            const unsigned take = std::min<unsigned>(base_bits - collected, limb_bits - offset);
+            const mp_limb_t limb = limbs[idx];
+            mp_limb_t chunk = limb >> offset;
+            if (take < GMP_NUMB_BITS) {
+                chunk &= mask_bits(take);
+            }
+
+            const u64 term = (u64)((u128)(chunk % mod) * (u128)S.pow2[collected] % mod);
+            acc_mod += term;
+            if (acc_mod >= mod) acc_mod -= mod;
+
+            collected += take;
+            ++idx;
+            offset = 0;
+        }
+
+        out[i] = F.from_uint(acc_mod);
+    }
+}
+
+inline std::vector<Fp> mul_kronecker_coeffs(const FpCtx& F,
+                                            const std::vector<Fp>& a,
+                                            const std::vector<Fp>& b) {
+    if (a.empty() || b.empty()) return {};
+
+    const std::size_t n = a.size();
+    const std::size_t m = b.size();
+    const std::size_t min_len = std::min(n, m);
+    const unsigned base_bits = choose_base_bits(F.modulus(), min_len);
+
+    static thread_local MpnScratch S;
+    static thread_local PackScratch PS;
+
+    const mp_size_t limbs_a = pack_poly_bits(S.A, a, base_bits);
+    const mp_size_t limbs_b = pack_poly_bits(S.B, b, base_bits);
+
+    const mp_size_t limbs_res = limbs_a + limbs_b;
+    S.C.resize((std::size_t)limbs_res);
+
+    const bool same_operands = (&a == &b) || (a.data() == b.data() && a.size() == b.size());
+    if (same_operands) {
+        mpn_sqr(S.C.data(), S.A.data(), limbs_a);
+    } else if (limbs_a == limbs_b) {
+        mpn_mul_n(S.C.data(), S.A.data(), S.B.data(), limbs_a);
+    } else if (limbs_a > limbs_b) {
+        mpn_mul(S.C.data(), S.A.data(), limbs_a, S.B.data(), limbs_b);
+    } else {
+        mpn_mul(S.C.data(), S.B.data(), limbs_b, S.A.data(), limbs_a);
+    }
+
+    mp_size_t used_limbs = limbs_res;
+    while (used_limbs > 0 && S.C[(std::size_t)used_limbs - 1] == 0) --used_limbs;
+    if (used_limbs == 0) used_limbs = 1;
+
+    std::vector<Fp> out(n + m - 1, F.zero());
+    unpack_poly_bits(out, S.C.data(), used_limbs, base_bits, F, PS);
+    return out;
+}
+#endif
+
 } // namespace detail
 
 
@@ -1089,6 +1302,12 @@ public:
 
         if (is_zero() || g.is_zero()) return FpPoly(F);
 
+#ifdef PI_HAVE_GMP
+        std::vector<Fp> out = detail::mul_kronecker_coeffs(F, c_, g.c_);
+        FpPoly res(F, std::move(out));
+        res.trim();
+        return res;
+#else
         const std::size_t n = c_.size();
         const std::size_t m = g.c_.size();
         const std::size_t need = n + m - 1;
@@ -1212,6 +1431,7 @@ public:
         FpPoly res(F, std::move(out));
         res.trim();
         return res;
+#endif
     }
 
 
